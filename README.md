@@ -86,3 +86,8 @@ Run the test suite using Python from the virtual environment:
 - [System architecture](file:///D:/AI/Github/document-desk/docs/ARCHITECTURE.md): Components, data flow, payload schemas, and storage.
 - [Operations runbook](file:///D:/AI/Github/document-desk/docs/RUNBOOK.md): Setup, configuration, workflows, and troubleshooting.
 - [Implementation status](file:///D:/AI/Github/document-desk/STATUS.md): Checklist and test results.
+
+## License
+
+This project is licensed under the terms of the [MIT License](LICENSE).
+
