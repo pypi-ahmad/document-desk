@@ -1,0 +1,8 @@
+.env
+.venv/
+data/
+__pycache__/
+*.pyc
+.code-review-graph/
+.codegraph/
+*.egg-info/

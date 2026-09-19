@@ -1,0 +1,10 @@
+streamlit
+openai
+python-dotenv
+pymupdf
+pypdf
+pillow
+pandas
+pydantic
+qdrant-client
+httpx
