@@ -54,8 +54,10 @@ cd D:\AI\Github\document-desk
 
 | Page | File | Purpose |
 | :--- | :--- | :--- |
-| Document Desk | `pages/1_Document_Desk.py` | Ingests documents, extracts per-page text, extracts structured JSON, and answers questions with page citations via Qdrant. |
-| Compare Versions | `pages/2_Compare.py` | Computes Python set differences on field names and asks the model to compare field values. |
+| Upload | `pages/1_Upload.py` | Ingests documents, saves to `data/uploads/`, and extracts per-page text via PyMuPDF. |
+| Extract | `pages/2_Extract.py` | Extracts structured JSON (fields, tables, summary, citations) and shows editable dataframe. |
+| Ask | `pages/3_Ask.py` | Indexes chunks into embedded Qdrant and answers questions with page citations. |
+| Compare | `pages/4_Compare.py` | Computes Python set differences on field names and asks the model to compare field values. |
 
 ## Environment variables
 

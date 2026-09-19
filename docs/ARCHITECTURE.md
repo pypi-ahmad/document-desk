@@ -10,8 +10,10 @@ Document Desk runs locally on Windows 11. It combines local PDF text extraction 
 flowchart TD
     subgraph UI ["User interface (Streamlit on Windows 11)"]
         Nav["Navigation (app.py)"]
-        P1["Document Desk (pages/1_Document_Desk.py)"]
-        P2["Compare Versions (pages/2_Compare.py)"]
+        P1["Upload (pages/1_Upload.py)"]
+        P2["Extract (pages/2_Extract.py)"]
+        P3["Ask (pages/3_Ask.py)"]
+        P4["Compare (pages/4_Compare.py)"]
     end
 
     subgraph Core ["Processing engine"]
@@ -36,19 +38,17 @@ flowchart TD
         GeminiAPI["Google Gemini<br/>gemini-3.5-flash-lite, gemini-3.7-flash"]
     end
 
-    Nav --> P1 & P2
-    P1 --> Cfg
+    Nav --> P1 & P2 & P3 & P4
     P1 --> Uploads
     P1 --> Extract
-    Extract --> Uploads
-    Extract --> Pages
+    P2 --> Extract
     Extract --> LLM
     LLM --> Providers
-    P1 --> Vec
+    P3 --> Vec
     Vec --> QdrantDB
-    P1 --> QA
+    P3 --> QA
     QA --> LLM
-    P2 --> QA
+    P4 --> QA
 ```
 
 ## Subsystems

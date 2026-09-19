@@ -48,16 +48,16 @@ The app runs locally at `http://localhost:8501`.
 ## Workflows
 
 ### 1. Document ingestion and text extraction
-Open the Document Desk page (`pages/1_Document_Desk.py`). Upload a PDF or image file, or select an existing document from `data/uploads/` or `data/fixtures/sample.pdf`. PyMuPDF extracts text per page. If a page has fewer than 20 characters of text, the app shows a warning that vision models require a public image URL and that v1 is text-first.
+Open the Upload page (`pages/1_Upload.py`). Upload a PDF or image file, or select an existing document from `data/uploads/` or `data/fixtures/sample.pdf`. PyMuPDF extracts text per page. If a page has fewer than 20 characters of text, the app shows a warning that vision models require a public image URL and that v1 is text-first.
 
 ### 2. Structured data extraction
-Select an active provider and model in the sidebar. Click "Run Structured Extraction" to generate document title, document type, fields, tables, summary, and citations. You can edit the fields and tables directly in the interface or download the result as JSON.
+Open the Extract page (`pages/2_Extract.py`). Select an active provider and model in the sidebar. Click "Run Agnes Extraction" to generate document title, document type, fields, tables, summary, and citations. You can view or edit the fields dataframe directly in the interface or download the result as JSON.
 
 ### 3. Ask questions with page citations
-Click "Index / Re-Index Document Chunks" to store text in embedded Qdrant (`path="data/qdrant"`). Submit a question to query chunks filtered by `file_id`. The response answers strictly from context and cites specific pages in brackets, such as `[Page 1]`. If no chunks match, the app displays an empty retrieval message.
+Open the Ask page (`pages/3_Ask.py`). Click "Index / Re-Index Document into Qdrant" to store text in embedded Qdrant (`path="data/qdrant"`). Submit a question to query chunks filtered by `file_id`. The response answers strictly from context and cites specific pages in brackets, such as `[Page 1]`. If no chunks match, the app displays an empty retrieval message.
 
 ### 4. Compare document versions
-Open the Compare Versions page (`pages/2_Compare.py`). Select Document A and Document B. Click "Compare Versions at Field Level". The page calculates a Python set difference of field names, then asks the model to compare the values of shared fields and output a comparison table.
+Open the Compare page (`pages/4_Compare.py`). Select Document A and Document B. Click "Compare Versions at Field Level". The page calculates a Python set difference of field names, then asks the model to compare the values of shared fields and output a comparison table.
 
 ## Automated smoke tests
 
