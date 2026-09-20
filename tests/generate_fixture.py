@@ -4,6 +4,11 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
 def generate_fixture():
+    """Create the detailed invoice fixture used by legacy smoke tests.
+
+    Returns:
+        Path to the generated `tests/fixtures/sample_invoice.png` image.
+    """
     fixtures_dir = Path(__file__).resolve().parent / "fixtures"
     fixtures_dir.mkdir(parents=True, exist_ok=True)
     out_path = fixtures_dir / "sample_invoice.png"
@@ -64,6 +69,11 @@ def generate_fixture():
 
 
 def generate_sample_page():
+    """Create the compact invoice-page fixture used by current OCR smokes.
+
+    Returns:
+        Path to the generated `data/fixtures/sample_page.png` image.
+    """
     fixtures_dir = Path(__file__).resolve().parent.parent / "data" / "fixtures"
     fixtures_dir.mkdir(parents=True, exist_ok=True)
     out_path = fixtures_dir / "sample_page.png"
@@ -78,4 +88,3 @@ def generate_sample_page():
 if __name__ == "__main__":
     generate_fixture()
     generate_sample_page()
-

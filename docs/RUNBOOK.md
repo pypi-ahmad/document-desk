@@ -1,144 +1,98 @@
-# Document Desk Runbook
+# Document Desk operations runbook
 
-This runbook covers installation, configuration, standard operations, testing, and troubleshooting for Document Desk on Windows 11.
+Use this runbook to operate and recover a local Document Desk instance on
+Windows 11. For first-time setup, use [developer onboarding](ONBOARDING.md).
+For code ownership and APIs, use the [developer guide](DEVELOPER_GUIDE.md).
 
-## System Requirements
+## Operating constraints
 
-- Native Windows 11 without WSL2 or Docker.
-- Python 3.11 or newer, accessible via `py -3`.
-- Ollama Desktop running on `http://127.0.0.1:11434`.
-- Model `AuditAid/PaddleOCR-VL-1.6-0.9B` installed in Ollama.
-- An `AGNESAI_API_KEY` with access to `https://apihub.agnes-ai.com/v1`.
-- Optional: `OPENAI_API_KEY` and `OPENAI_BASE_URL` or `GOOGLE_API_KEY` for alternate providers.
+- Run native Windows only; do not use WSL2 or Docker.
+- Use one Streamlit or Qdrant-writing script process at a time.
+- Keep `.env`, `.venv`, and `data/` local. They are intentionally gitignored.
+- Do not log or share `AGNESAI_API_KEY`.
 
-## Environment & Service Setup
+## Start and stop
 
-### 1. Set Up Ollama Local Vision-Language Model
+Double-click `run.cmd` in the repository root. If `.env` is absent, the script
+copies `.env.example`, opens Notepad, and exits. Save configuration, then run
+the script again to create the environment, install dependencies, and start
+Streamlit.
 
-Open PowerShell and pull the model:
+The service listens at `http://localhost:8592`. Stop it with `Ctrl+C`
+in the terminal that started it. Do not start another instance while one is
+using `data/qdrant`.
+
+## Standard document workflow
+
+1. **Upload** a PDF or image. This establishes the active `file_id`.
+2. **Inspect** the PDF type, confidence, route, route reason, and Markdown.
+3. **OCR** only when the route is `ollama`; native documents skip it.
+4. **Extract** sends page text to Agnes and automatically indexes chunks for
+   the active `file_id`.
+5. **Ask** becomes available after Extract and retrieves only that file's
+   chunks.
+6. **Compare** selects two available file IDs and shows field-name and
+   field-value differences.
+
+## Service health and recovery
+
+### Ollama offline or model missing
+
+Health and OCR show the following exact recovery instruction:
+
+```text
+start Ollama, then: ollama pull AuditAid/PaddleOCR-VL-1.6-0.9B
+```
+
+Start Ollama, then run:
+
 ```powershell
 ollama pull AuditAid/PaddleOCR-VL-1.6-0.9B
 ```
-Verify the model is running:
+
+The Health page checks `http://127.0.0.1:11434/api/tags`. OCR uses `OCR:` and,
+when selected, `Table Recognition:` at temperature `0`.
+
+### Agnes key missing or rejected
+
+Extract, Ask, and Compare require `AGNESAI_API_KEY`. Set it in the Windows user
+environment or the ignored `.env` file. Restart the launcher after changing the
+environment. The key is never displayed by Health.
+
+HTTP 429 responses are retried with backoff by `src/agnes_client.py`. HTTP 401
+or 403 means the configured key needs attention; do not paste it into logs or
+issues.
+
+### Qdrant is locked
+
+Embedded Qdrant has a single-process storage lock. Stop Streamlit before
+running a smoke that writes to `data/qdrant`, or wait for indexing to finish.
+If a local process ended unexpectedly, close only the known Document Desk
+Python process before retrying. Do not broadly terminate unrelated Python work.
+
+## Smoke-test matrix
+
+Run commands from the repository root with `.venv\Scripts\python.exe`.
+
+| Command | Prerequisites | Output or coverage |
+| --- | --- | --- |
+| `scripts\smoke_inspect.py` | Local dependencies | Native PDF inspection and `data/cache/last_inspect.json`. |
+| `scripts\smoke_workflow.py` | Local dependencies | Streamlit active-file flow, OCR skip, Ask gate, and exports. |
+| `scripts\smoke_ocr.py` | Ollama and model | Fixture OCR and `data/cache/last_ocr.json`. |
+| `scripts\smoke_ollama_route.py` | Ollama and model | Forced OCR route, pypdfium2 rendering, and OCR cache. |
+| `scripts\smoke_extract.py` | Agnes key plus cached text | Extraction, Qdrant retrieval, Ask, and extract/ask caches. |
+| `scripts\smoke_extract_ask.py` | Agnes key; Ollama if no OCR cache | OCR text through Extract, Ask, and Compare. |
+
+Example local-only checks:
+
 ```powershell
-ollama run AuditAid/PaddleOCR-VL-1.6-0.9B "OCR:"
+.venv\Scripts\python.exe -c "import app, src.pdf_inspect, src.ollama_ocr, src.extract, src.store"
+.venv\Scripts\python.exe scripts\smoke_inspect.py
+.venv\Scripts\python.exe scripts\smoke_workflow.py
 ```
 
-### 2. Configure the Agnes AI API Key
+## Data recovery expectations
 
-Set `AGNESAI_API_KEY` in your Windows user profile using PowerShell:
-```powershell
-[System.Environment]::SetEnvironmentVariable('AGNESAI_API_KEY', 'your-secret-key-here', 'User')
-```
-
-Alternatively, add it to `.env` in the repository root:
-```ini
-AGNESAI_API_KEY=your-secret-key-here
-AGNES_BASE_URL=https://apihub.agnes-ai.com/v1
-```
-
-Optional providers can be configured in `.env` if desired:
-```ini
-OPENAI_API_KEY=your-openai-key
-OPENAI_BASE_URL=https://api.openai.com/v1
-GOOGLE_API_KEY=your-gemini-key
-```
-
-Do not commit `.env` or write API keys into source files. The `.gitignore` file excludes `.env`.
-
-## Starting the Application
-
-### Launch with run.cmd
-Double-click `run.cmd` in Windows Explorer or run it from a terminal. The script will:
-1. Create `.env` from `.env.example` and open Notepad if `.env` is missing, then exit.
-2. Create `.venv` using `py -3 -m venv .venv` if needed.
-3. Install packages listed in `requirements.txt`.
-4. Run `streamlit run app.py`.
-
-The app runs locally at `http://localhost:8501`.
-
-## Workflows
-
-### 1. Document Ingestion & Local OCR
-Open the Upload page (`pages/1_Upload.py`).
-- Displays Ollama status. If Ollama is offline or model missing, an informative banner appears: `start Ollama Desktop, then ollama pull AuditAid/PaddleOCR-VL-1.6-0.9B`. The app does not crash.
-- Upload a PDF or image file (or select an existing document).
-- For scanned pages or image uploads, `pypdfium2` renders page PNGs to `data/pages/<file_id>/page_<n>.png` and passes them as local image attachments to Ollama `AuditAid/PaddleOCR-VL-1.6-0.9B`.
-- Default pass runs prompt prefix `OCR:`.
-- If table extraction is enabled, a secondary pass runs `Table Recognition:`.
-
-### 2. Structured Data Extraction
-Open the Extract page (`pages/2_Extract.py`). Select an active provider and model in the sidebar. Click "Run Agnes Extraction" to generate document title, document type, fields, tables, summary, and citations. You can view or edit the fields dataframe directly in the interface or download the result as JSON.
-
-### 3. Ask Questions with Page Citations
-Open the Ask page (`pages/3_Ask.py`). Click "Index / Re-Index Document into Qdrant" to store text in embedded Qdrant (`path="data/qdrant"`). Submit a question to query chunks filtered by `file_id`. The response answers strictly from context and cites specific pages in brackets, such as `[Page 1]`. If no chunks match, the app displays an empty retrieval message.
-
-### 4. Compare Document Versions
-Open the Compare page (`pages/4_Compare.py`). Select Document A and Document B. Click "Compare Versions at Field Level". The page calculates a Python set difference of field names, then asks the model to compare the values of shared fields and output a comparison table.
-
-## Automated Smoke Tests
-
-Run the smoke tests directly from the virtual environment:
-
-### 1. Smoke OCR on Fixture Page + Agnes Extraction
-```cmd
-.venv\Scripts\python.exe tests/smoke_ocr_agnes.py
-```
-Validates fixture PNG generation, Ollama VL dual-pass OCR (`OCR:` and `Table Recognition:`), and structured extraction with `agnes-3.0-flash`.
-
-### 2. End-to-End Pipeline Smoke Test
-```cmd
-.venv\Scripts\python.exe tests/smoke_pipeline.py
-```
-Validates `pdf-inspector` classification, `pypdfium2` rendering, Ollama VL OCR, Agnes AI structuring, embedded Qdrant chunk indexing/retrieval, and document diffing.
-
-### 3. Extraction Smoke Test
-```cmd
-.venv\Scripts\python.exe tests/smoke_extract.py
-```
-Verifies fixture generation, PyMuPDF extraction, JSON parsing with `agnes-3.0-flash`, schema conformance, and caching to `data/cache/last_extract.json`.
-
-### 4. Qdrant and QA Smoke Test
-```cmd
-.venv\Scripts\python.exe tests/smoke_ask_fixture.py
-```
-Verifies chunk indexing into embedded Qdrant with payload `{file_id, page, text}`, filtered retrieval by `file_id`, and answer generation with `[Page 1]` citations.
-
-### 5. Field Comparison Smoke Test
-```cmd
-.venv\Scripts\python.exe tests/smoke_compare.py
-```
-Verifies Python-side field set difference calculations and calls the model for field-level diff reporting.
-
-## Troubleshooting
-
-### Ollama Offline or Model Missing
-If the Upload page displays:
-`start Ollama Desktop, then ollama pull AuditAid/PaddleOCR-VL-1.6-0.9B`:
-1. Ensure the Ollama service is active:
-   ```powershell
-   Get-Process ollama*
-   ```
-2. Pull the required model:
-   ```powershell
-   ollama pull AuditAid/PaddleOCR-VL-1.6-0.9B
-   ```
-
-### Missing AGNESAI_API_KEY
-If you see an error indicating `AGNESAI_API_KEY is not set in the environment`:
-1. Check that the variable exists in your Windows environment or `.env` file.
-2. If setting via `setx`, restart your terminal session for the change to take effect.
-
-### Authentication Errors (HTTP 401 or 403)
-Verify that your API key is valid and active on the Agnes AI console.
-
-### Rate Limits (HTTP 429)
-The client in `src/agnes_client.py` retries automatically with exponential backoff.
-
-### Database Locked in Qdrant
-Embedded Qdrant locks its SQLite files in `data/qdrant/` during use.
-1. Do not run CLI test scripts while Streamlit is performing an indexing operation.
-2. If an earlier process terminated unexpectedly and held the lock, close remaining Python processes:
-   ```powershell
-   Stop-Process -Name "python" -Force -ErrorAction SilentlyContinue
-   ```
+`data/` is working state, not a source-controlled backup. It contains uploads,
+rendered PNGs, caches, fixtures, and Qdrant files. Preserve it when you need
+local history; regenerate it through the app or smokes when it is safe to do so.

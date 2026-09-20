@@ -31,6 +31,16 @@ from src.vector_store import get_qdrant_client, index_document_chunks, search_do
 
 
 def run_pipeline_smoke():
+    """Run the legacy live end-to-end pipeline smoke.
+
+    Returns:
+        True when inspection, rendering, OCR, structuring, retrieval, Ask, and
+        comparison checks succeed.
+
+    Raises:
+        AssertionError: If a stage does not satisfy its expected smoke contract.
+        Exception: If a required local or Agnes service fails.
+    """
     print("=== 1. Testing pdf-inspector API Attributes ===")
     fixture_png = generate_fixture()
     

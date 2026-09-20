@@ -12,6 +12,15 @@ from src.document_processor import run_page_ocr
 from src.agnes_client import structure_document_text
 
 def run_test():
+    """Run live local OCR followed by Agnes structuring on an invoice fixture.
+
+    Returns:
+        True when the OCR and Agnes output assertions pass.
+
+    Raises:
+        AssertionError: If expected OCR or structuring output is absent.
+        Exception: If required local or Agnes services cannot complete a request.
+    """
     print("=== Step 1: Generate Test Fixture Page ===")
     fixture_path = generate_fixture()
     assert fixture_path.exists(), "Fixture image was not created"

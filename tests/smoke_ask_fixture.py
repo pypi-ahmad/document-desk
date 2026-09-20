@@ -14,12 +14,22 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE_DIR))
 
 from src.config import FIXTURES_DIR, QDRANT_PATH, QDRANT_COLLECTION, is_agnes_key_set
-from src.extract import ensure_sample_pdf, extract_pages_pymupdf
+from src.extract import ensure_sample_pdf, extract_pages
 from src.vector_store import get_qdrant_client, index_document_pages_or_text, search_document_chunks
 from src.qa_service import answer_question_with_page_citations
 
 
 def run_smoke_ask():
+    """Run the fixture indexing, file-scoped retrieval, and live Agnes Ask smoke.
+
+    Returns:
+        True when fixture extraction, Qdrant retrieval, and cited answer checks
+        complete.
+
+    Raises:
+        RuntimeError: If `AGNESAI_API_KEY` is unavailable.
+        AssertionError: If fixture, retrieval, or cited-answer checks fail.
+    """
     print("=== Step 0: Check AGNESAI_API_KEY ===")
     if not is_agnes_key_set():
         raise RuntimeError(
@@ -34,8 +44,8 @@ def run_smoke_ask():
     assert sample_pdf.exists(), f"Fixture PDF missing at {sample_pdf}"
     print(f"[PASS] Fixture PDF verified at {sample_pdf}")
 
-    print("\n=== Step 2: Extract Pages with PyMuPDF ===")
-    pages_info, _ = extract_pages_pymupdf(sample_pdf)
+    print("\n=== Step 2: Extract Pages with pdf-inspector / pypdfium2 ===")
+    pages_info, _ = extract_pages(sample_pdf)
     print(f"Extracted {len(pages_info)} page(s) from fixture.")
     assert len(pages_info) > 0, "No pages extracted"
 
