@@ -50,8 +50,9 @@ def render_pdf_pages(
 
     if suffix == ".pdf":
         doc = fitz.open(str(path))
-        # 72 points per inch standard PDF coordinate system
-        zoom = max(150, min(dpi, 300)) / 72.0
+        # 72 points per inch standard PDF coordinate system (150-200 dpi)
+        target_dpi = max(72, min(dpi, 300))
+        zoom = target_dpi / 72.0
         mat = fitz.Matrix(zoom, zoom)
 
         for idx, page in enumerate(doc):
