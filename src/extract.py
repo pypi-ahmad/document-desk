@@ -1,13 +1,13 @@
-"""Document extraction module using Ollama PaddleOCR-VL, PyMuPDF, and Agnes AI.
+"""Document extraction module using pdf-inspector, pypdfium2, Ollama PaddleOCR-VL, and Agnes AI.
 
 Pipeline:
 1. User uploads a PDF or image.
-2. Local OCR / page parse via Ollama model AuditAid/PaddleOCR-VL-1.6-0.9B:
-   - Uses task prefix 'OCR:'
-   - Optional second pass 'Table Recognition:' if tables enabled
-   - Renders PDF pages with pypdfium2/PyMuPDF to local PNG
-   - Passes page images as local image attachments (path or bytes) to Ollama
-   - Never sends local disk paths to Agnes as public image URLs
+2. PDF engine:
+   - Primary: pdf-inspector (process_pdf) classifies document and extracts native markdown if text_based.
+   - If scanned or image_based: renders pages with pypdfium2 to PNG under data/pages/<file_id>/page-0001.png
+   - Local OCR via Ollama model AuditAid/PaddleOCR-VL-1.6-0.9B with task prefix 'OCR:' (and optional 'Table Recognition:')
+   - Passes page images as local image attachments (path or bytes) to Ollama.
+   - Never sends local disk paths to Agnes as public image URLs.
 3. Agnes AI (agnes-3.0-flash via official openai SDK) structures fields, tables, summary, citations.
 4. Cached extraction saved to data/cache/last_extract.json.
 """
@@ -17,27 +17,27 @@ import json
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
-import pymupdf as fitz
-from PIL import Image
-
-from src.agnes_client import chat_completion_with_retry, AgnesClientError
+from PIL import Image, ImageDraw
+from src.agnes_client import chat_completion_with_retry
 from src.config import (
+    AGNES_MODEL,
     CACHE_DIR,
     FIXTURES_DIR,
-    PAGES_DIR,
-    AGNES_MODEL,
-    is_agnes_key_set,
-    OLLAMA_OCR_MODEL,
-    TASK_OCR,
-    TASK_TABLE,
 )
 from src.ollama_ocr import check_ollama_status, run_page_ocr
-from src.render_pages import render_page
+from src.pdf_inspect import inspect_pdf
+from src.render_pages import render_all_pages, render_page
 
 
 @dataclass
 class FieldItem:
-    """Extracted key-value field with source page number."""
+    """Represent one extracted field and its source page.
+
+    Attributes:
+        name: Field label supplied or inferred by extraction.
+        value: Extracted field value.
+        page: One-based page supporting the value.
+    """
     name: str = "Field"
     value: Any = ""
     page: int = 1
@@ -45,14 +45,25 @@ class FieldItem:
 
 @dataclass
 class CitationItem:
-    """Factual claim citation with page reference."""
+    """Represent one factual extraction claim and its source page.
+
+    Attributes:
+        claim: Factual statement from the document.
+        page: One-based page supporting the claim.
+    """
     claim: str = ""
     page: int = 1
 
 
 @dataclass
 class TableItem:
-    """Extracted table with title, column headers, and row data."""
+    """Represent an extracted table.
+
+    Attributes:
+        title: Human-readable table title.
+        headers: Column header labels.
+        rows: Row values in header order.
+    """
     title: str = "Table"
     headers: List[str] = field(default_factory=list)
     rows: List[List[Any]] = field(default_factory=list)
@@ -60,17 +71,30 @@ class TableItem:
 
 @dataclass
 class ExtractionResult:
-    """Normalized output schema from Agnes AI."""
+    """Represent the normalized Agnes extraction schema.
+
+    Attributes:
+        title: Document title or main header.
+        doc_type: Document classification.
+        fields: Extracted key-value fields with page references.
+        tables: Extracted tables.
+        summary: Factual document summary.
+        citations: Factual claims with page references.
+    """
     title: str = "Untitled Document"
     doc_type: str = "General Document"
     fields: List[FieldItem] = field(default_factory=list)
     tables: List[TableItem] = field(default_factory=list)
     summary: str = ""
     citations: List[CitationItem] = field(default_factory=list)
-    page_citations: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
-        """Return as a standard serializable dictionary matching the required schema."""
+        """Serialize the normalized extraction result.
+
+        Returns:
+            JSON-serializable mapping with title, doc_type, fields, tables,
+            summary, and citations keys.
+        """
         return {
             "title": self.title,
             "doc_type": self.doc_type,
@@ -87,19 +111,28 @@ class ExtractionResult:
                 {"claim": c.claim, "page": c.page}
                 for c in self.citations
             ],
-            "page_citations": self.page_citations,
         }
 
 
 def ensure_sample_pdf(pdf_path: Optional[Path] = None) -> Path:
-    """Ensure data/fixtures/sample.pdf exists with a clean invoice-like layout."""
+    """Return a local invoice-like PDF fixture, creating it when absent.
+
+    Args:
+        pdf_path: Optional fixture target. Defaults to `data/fixtures/sample.pdf`.
+
+    Returns:
+        Existing or newly generated PDF fixture path.
+
+    Raises:
+        OSError: If Pillow cannot create the target file.
+    """
     target_path = Path(pdf_path) if pdf_path else (FIXTURES_DIR / "sample.pdf")
     if target_path.exists():
         return target_path
 
     target_path.parent.mkdir(parents=True, exist_ok=True)
-    doc = fitz.open()
-    page = doc.new_page(width=612, height=792)  # Standard Letter
+    img = Image.new("RGB", (800, 1000), color=(255, 255, 255))
+    draw = ImageDraw.Draw(img)
 
     content_lines = [
         "INVOICE & CONSULTING SERVICES AGREEMENT",
@@ -129,46 +162,40 @@ def ensure_sample_pdf(pdf_path: Optional[Path] = None) -> Path:
 
     y_pos = 50
     for line in content_lines:
-        font_size = 14 if "INVOICE" in line else 11
-        page.insert_text((50, y_pos), line, fontsize=font_size)
-        y_pos += 24
+        draw.text((50, y_pos), line, fill=(0, 0, 0))
+        y_pos += 26
 
-    doc.save(str(target_path))
-    doc.close()
+    img.save(str(target_path), "PDF", resolution=150.0)
     return target_path
 
 
 def parse_and_harden_json(raw_text: str) -> Dict[str, Any]:
-    """Robustly parse JSON response from LLM, fixing markdown fences and common issues."""
+    """Extract the first valid JSON object from an Agnes response.
+
+    Args:
+        raw_text: Model response that may include prose or Markdown fences.
+
+    Returns:
+        The first decoded JSON object found in response order.
+
+    Raises:
+        ValueError: If no valid JSON object can be decoded.
+    """
     cleaned = raw_text.strip()
+    cleaned = re.sub(r"```(?:json)?|```", "", cleaned, flags=re.IGNORECASE)
+    decoder = json.JSONDecoder()
 
-    # 1. Strip markdown code fences
-    if "```" in cleaned:
-        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.MULTILINE)
-        cleaned = re.sub(r"\s*```$", "", cleaned, flags=re.MULTILINE)
-        cleaned = cleaned.strip()
-
-    # 2. Direct JSON parse
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
-        pass
-
-    # 3. Search for outermost JSON object { ... }
-    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
-    if match:
-        candidate = match.group(0)
-        try:
-            return json.loads(candidate)
-        except json.JSONDecodeError:
-            # 4. Clean trailing commas before closing braces/brackets
-            fixed = re.sub(r",\s*([\]}])", r"\1", candidate)
+    for candidate in (cleaned, re.sub(r",\s*([}\]])", r"\1", cleaned)):
+        for match in re.finditer(r"\{", candidate):
             try:
-                return json.loads(fixed)
+                data, _ = decoder.raw_decode(candidate[match.start():])
             except json.JSONDecodeError:
-                pass
+                continue
+            if isinstance(data, dict):
+                return data
 
-    raise ValueError(f"Failed to parse valid JSON from LLM response:\n{raw_text[:500]}")
+    raise ValueError("Agnes response did not contain a valid JSON object")
+
 
 
 def extract_document_pages(
@@ -176,21 +203,23 @@ def extract_document_pages(
     file_id: Optional[str] = None,
     force_ocr: bool = False,
     include_tables: bool = False,
-    user_image_url: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], str]:
-    """Extract per-page text from PDF or image using local Ollama VL or native text.
-    
-    Hard rules:
-    - Ollama model: AuditAid/PaddleOCR-VL-1.6-0.9B
-    - Page images are local PNG/JPEG passed as Ollama image attachments (path or bytes).
-    - Never send local disk paths to Agnes as public image URLs.
-    - Default OCR pass: 'OCR:'
-    - Second pass: 'Table Recognition:' if include_tables=True.
-    - If Ollama is down or model missing: clear error message:
-      'start Ollama Desktop, then ollama pull AuditAid/PaddleOCR-VL-1.6-0.9B'.
-    
+    """Extract page text through native inspection or routed local OCR.
+
+    Args:
+        file_path: Existing PDF or supported image path.
+        file_id: Optional active-document identifier for rendered pages.
+        force_ocr: Whether a PDF must use OCR despite its inspection result.
+        include_tables: Whether OCR runs the table-recognition second pass.
+
     Returns:
-      (pages_info, concatenated_text)
+        Page dictionaries and concatenated text. Local image paths remain only
+        in local page records and are never sent to Agnes.
+
+    Raises:
+        FileNotFoundError: If `file_path` does not exist.
+        ValueError: If the source extension is unsupported.
+        RuntimeError: If required Ollama OCR is unavailable.
     """
     path = Path(file_path).resolve()
     if not path.is_file():
@@ -204,125 +233,110 @@ def extract_document_pages(
     pages_info: List[Dict[str, Any]] = []
     concatenated_blocks: List[str] = []
 
-    # Check Ollama status
-    is_online, has_model, ollama_instruction, _ = check_ollama_status()
-    ollama_ready = is_online and has_model
-
     if suffix == ".pdf":
-        doc = fitz.open(str(path))
-        page_count = len(doc)
+        inspection = inspect_pdf(path, force_ocr=force_ocr)
+        pdf_type = inspection["pdf_type"]
+        confidence = inspection["confidence"]
+        page_count = inspection["page_count"]
+        md_text = inspection["markdown"]
 
-        for idx in range(page_count):
-            page_num = idx + 1
-            page = doc[idx]
-            raw_text = page.get_text().strip()
-            has_native_text = len(raw_text) >= 20
+        if inspection["route"] == "native":
+            pages_info.append({
+                "page_number": 1,
+                "text": md_text,
+                "has_text": True,
+                "image_path": None,
+                "ocr_text": "",
+                "table_text": "",
+                "method": "pdf-inspector-native",
+                "warning": None,
+                "pdf_type": pdf_type,
+                "confidence": confidence,
+            })
+            concatenated_blocks.append(f"--- Page 1 ---\n{md_text}")
+        else:
+            is_online, has_model, ollama_instruction, _ = check_ollama_status()
+            if not (is_online and has_model):
+                raise RuntimeError(ollama_instruction)
 
-            # Determine if this page should undergo Ollama VL OCR
-            should_run_ocr = force_ocr or (not has_native_text)
-
-            if should_run_ocr:
-                # Render page to PNG using pypdfium2
-                try:
-                    img_path = render_page(path, page_num, file_id=file_id, dpi=150)
-                except Exception:
-                    # Fallback to PyMuPDF pixmap
-                    target_dir = PAGES_DIR / file_id
-                    target_dir.mkdir(parents=True, exist_ok=True)
-                    img_path = target_dir / f"page_{page_num}.png"
-                    pix = page.get_pixmap(dpi=150)
-                    pix.save(str(img_path))
-
-                if ollama_ready:
-                    # Run Ollama VL: Pass 1: OCR: ; Pass 2: Table Recognition: (if enabled)
-                    ocr_res = run_page_ocr(
-                        image_input=img_path,
-                        include_tables=include_tables,
-                        task_prefix=TASK_OCR,
-                    )
-                    page_text = ocr_res["combined_text"]
-                    pages_info.append({
-                        "page_number": page_num,
-                        "text": page_text,
-                        "has_text": bool(page_text.strip()),
-                        "image_path": str(img_path),
-                        "ocr_text": ocr_res.get("ocr_text", ""),
-                        "table_text": ocr_res.get("table_text", ""),
-                        "method": "ollama_paddleocr_vl",
-                        "warning": None,
-                    })
-                    concatenated_blocks.append(f"--- Page {page_num} ---\n{page_text}")
-                else:
-                    # Ollama down or model missing
-                    warn_msg = ollama_instruction
-                    fallback_text = raw_text if has_native_text else f"[Page {page_num}: No text extracted. {ollama_instruction}]"
-                    pages_info.append({
-                        "page_number": page_num,
-                        "text": fallback_text,
-                        "has_text": has_native_text,
-                        "image_path": str(img_path),
-                        "ocr_text": "",
-                        "table_text": "",
-                        "method": "native_fallback_ollama_offline",
-                        "warning": warn_msg,
-                    })
-                    concatenated_blocks.append(f"--- Page {page_num} ---\n{fallback_text}")
-
+            pages_needing_ocr = inspection["pages_needing_ocr"]
+            if force_ocr or pdf_type in {"scanned", "image_based"} or not pages_needing_ocr:
+                target_pages = list(range(1, page_count + 1))
             else:
-                # Use native PyMuPDF text
+                target_pages = pages_needing_ocr
+
+            if pdf_type == "mixed" and inspection["markdown_usable"] and not force_ocr:
                 pages_info.append({
-                    "page_number": page_num,
-                    "text": raw_text,
+                    "page_number": 1,
+                    "text": md_text,
                     "has_text": True,
                     "image_path": None,
                     "ocr_text": "",
                     "table_text": "",
-                    "method": "pymupdf_native",
+                    "method": "pdf-inspector-native-mixed",
                     "warning": None,
+                    "pdf_type": pdf_type,
+                    "confidence": confidence,
                 })
-                concatenated_blocks.append(f"--- Page {page_num} ---\n{raw_text}")
+                concatenated_blocks.append(f"--- Native Markdown ---\n{md_text}")
 
-        doc.close()
+            for page_num in target_pages:
+                img_path = render_page(
+                    path,
+                    page_number_1based=page_num,
+                    file_id=file_id,
+                    dpi=150,
+                    route="ollama",
+                )
+                if img_path is None:
+                    raise RuntimeError(f"Failed to render page {page_num}")
+                ocr_res = run_page_ocr(
+                    image_input=img_path,
+                    include_tables=include_tables,
+                )
+                page_text = ocr_res["combined_text"]
+                pages_info.append({
+                    "page_number": page_num,
+                    "text": page_text,
+                    "has_text": bool(page_text.strip()),
+                    "image_path": str(img_path),
+                    "ocr_text": ocr_res.get("ocr_text", ""),
+                    "table_text": ocr_res.get("table_text", ""),
+                    "method": "pypdfium2_ollama_paddleocr_vl",
+                    "warning": None,
+                    "pdf_type": pdf_type,
+                    "confidence": confidence,
+                })
+                concatenated_blocks.append(f"--- Page {page_num} ---\n{page_text}")
 
     elif suffix in [".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff"]:
-        target_dir = PAGES_DIR / file_id
-        target_dir.mkdir(parents=True, exist_ok=True)
-        img_copy = target_dir / "page_1.png"
-        img = Image.open(path)
-        img.save(img_copy, format="PNG")
+        is_online, has_model, ollama_instruction, _ = check_ollama_status()
+        if not (is_online and has_model):
+            raise RuntimeError(ollama_instruction)
 
-        if ollama_ready:
-            ocr_res = run_page_ocr(
-                image_input=img_copy,
-                include_tables=include_tables,
-                task_prefix=TASK_OCR,
-            )
-            page_text = ocr_res["combined_text"]
-            pages_info.append({
-                "page_number": 1,
-                "text": page_text,
-                "has_text": bool(page_text.strip()),
-                "image_path": str(img_copy),
-                "ocr_text": ocr_res.get("ocr_text", ""),
-                "table_text": ocr_res.get("table_text", ""),
-                "method": "ollama_paddleocr_vl",
-                "warning": None,
-            })
-            concatenated_blocks.append(f"--- Page 1 ---\n{page_text}")
-        else:
-            warn_msg = ollama_instruction
-            note = f"[Page 1 Image: {ollama_instruction}]"
-            pages_info.append({
-                "page_number": 1,
-                "text": note,
-                "has_text": False,
-                "image_path": str(img_copy),
-                "ocr_text": "",
-                "table_text": "",
-                "method": "image_ollama_offline",
-                "warning": warn_msg,
-            })
-            concatenated_blocks.append(f"--- Page 1 ---\n{note}")
+        rendered_images = render_all_pages(
+            path,
+            file_id=file_id,
+            dpi=150,
+            route="ollama",
+        )
+        img_copy = rendered_images[0]
+        ocr_res = run_page_ocr(
+            image_input=img_copy,
+            include_tables=include_tables,
+        )
+        page_text = ocr_res["combined_text"]
+        pages_info.append({
+            "page_number": 1,
+            "text": page_text,
+            "has_text": bool(page_text.strip()),
+            "image_path": str(img_copy),
+            "ocr_text": ocr_res.get("ocr_text", ""),
+            "table_text": ocr_res.get("table_text", ""),
+            "method": "image_ollama_paddleocr_vl",
+            "warning": None,
+        })
+        concatenated_blocks.append(f"--- Page 1 ---\n{page_text}")
     else:
         raise ValueError(f"Unsupported document format: {suffix}")
 
@@ -330,25 +344,37 @@ def extract_document_pages(
     return pages_info, concatenated_text
 
 
-def extract_pages_pymupdf(
+def extract_pages(
     file_path: Union[str, Path],
-    user_image_url: Optional[str] = None,
     force_ocr: bool = False,
     include_tables: bool = False,
 ) -> Tuple[List[Dict[str, Any]], str]:
-    """Compatibility wrapper routing to extract_document_pages."""
+    """Extract pages through the compatibility extraction entry point.
+
+    Args:
+        file_path: Existing PDF or supported image path.
+        force_ocr: Whether a PDF must use OCR regardless of classification.
+        include_tables: Whether OCR runs table recognition.
+
+    Returns:
+        Page dictionaries and their concatenated text.
+
+    Raises:
+        FileNotFoundError: If `file_path` does not exist.
+        ValueError: If the source extension is unsupported.
+        RuntimeError: If required Ollama OCR is unavailable.
+    """
     return extract_document_pages(
         file_path=file_path,
         force_ocr=force_ocr,
         include_tables=include_tables,
-        user_image_url=user_image_url,
     )
 
 
-def _build_extraction_prompt(text_content: str, user_image_url: Optional[str] = None) -> List[Dict[str, str]]:
-    """Build messages array enforcing the required JSON schema."""
+def _build_extraction_prompt(text_content: str) -> List[Dict[str, str]]:
+    """Build messages array enforcing the required JSON schema from concatenated OCR text."""
     system_prompt = (
-        "You are an expert document understanding AI. Analyze the document text and return ONLY "
+        "You are an expert document understanding AI. Analyze the concatenated OCR page text and return ONLY "
         "a valid JSON object matching this exact schema:\n"
         "{\n"
         '  "title": "string",\n'
@@ -365,18 +391,16 @@ def _build_extraction_prompt(text_content: str, user_image_url: Optional[str] = 
         '  ]\n'
         "}\n\n"
         "Rules:\n"
-        "- 'fields' must be key-value pairs representing specific data points, dates, parties, amounts, identifiers.\n"
-        "- 'tables' must capture any tabular structures with column headers and rows.\n"
-        "- 'summary' must provide a factual summary of the document.\n"
-        "- 'citations' must be factual claims with the source page number.\n"
-        "- Output strictly raw JSON. Do not include markdown code fences or explanatory text."
+        "- 'title': Document title or main header.\n"
+        "- 'doc_type': Document classification (e.g. Invoice, Receipt, Contract, Agreement, Statement).\n"
+        "- 'fields': Array of key-value pairs with exact page citations.\n"
+        "- 'tables': Array of tables (or empty array [] if none).\n"
+        "- 'summary': Concise factual summary of the document contents.\n"
+        "- 'citations': Array of factual claims with page numbers.\n"
+        "- Output strictly raw JSON without markdown code fences or explanatory text."
     )
 
-    user_prompt = f"Document Text:\n{text_content}\n\n"
-    if user_image_url and (user_image_url.strip().startswith("http://") or user_image_url.strip().startswith("https://")):
-        user_prompt += f"Associated Public Document Image URL: {user_image_url.strip()}\n\n"
-
-    user_prompt += "Return the structured JSON extraction now:"
+    user_prompt = f"Document OCR Page Text:\n{text_content}\n\nReturn the structured JSON extraction now:"
 
     return [
         {"role": "system", "content": system_prompt},
@@ -438,12 +462,6 @@ def _normalize_parsed_data(parsed_json: Dict[str, Any], default_page: int = 1) -
                 p_num = int(m.group(1)) if m else default_page
                 citations_list.append(CitationItem(claim=c, page=p_num))
 
-    page_citations_strings = [
-        f"Page {c.page}: {c.claim}" for c in citations_list if c.claim
-    ]
-    if not page_citations_strings and isinstance(parsed_json.get("page_citations"), list):
-        page_citations_strings = [str(x) for x in parsed_json.get("page_citations")]
-
     return ExtractionResult(
         title=str(parsed_json.get("title", "Untitled Document")),
         doc_type=str(parsed_json.get("doc_type", "General Document")),
@@ -451,41 +469,43 @@ def _normalize_parsed_data(parsed_json: Dict[str, Any], default_page: int = 1) -
         tables=tables_list,
         summary=str(parsed_json.get("summary", "")),
         citations=citations_list,
-        page_citations=page_citations_strings,
     )
 
 
 def extract_with_agnes(
     content: Union[str, List[Dict[str, Any]]],
-    user_image_url: Optional[str] = None,
     model: str = AGNES_MODEL,
     provider_name: str = "Agnes AI",
     save_cache: bool = True,
     max_single_call_pages: int = 4,
     max_single_call_chars: int = 15000,
 ) -> Dict[str, Any]:
-    """Call LLM (agnes-3.0-flash by default) to extract structured JSON.
-    
-    Supports:
-    - One LLM call per document (default for typical documents).
-    - Per-page extraction if document is long (> 4 pages or > 15,000 chars).
-    
-    Returns JSON dictionary with schema:
-    {
-      title,
-      doc_type,
-      fields: [{name, value, page}],
-      tables: [{title, headers, rows}],
-      summary,
-      citations: [{claim, page}]
-    }
+    """Structure document text with Agnes and normalize its JSON output.
+
+    Args:
+        content: Concatenated text or page dictionaries containing source text.
+        model: Agnes model identifier.
+        provider_name: Configured provider display name.
+        save_cache: Whether to write `data/cache/last_extract.json`.
+        max_single_call_pages: Page count above which extraction runs per page.
+        max_single_call_chars: Character count above which extraction runs per page.
+
+    Returns:
+        Normalized title, doc_type, fields, tables, summary, and citations.
+
+    Raises:
+        AgnesClientError: If Agnes cannot complete an extraction request.
+        ValueError: If an Agnes response contains no valid JSON object.
+        OSError: If cache writing is requested but fails.
     """
     if isinstance(content, list):
         pages_info = content
-        concat_text = "\n\n".join(
-            f"--- Page {p.get('page_number', i+1)} ---\n{p.get('text', '')}"
-            for i, p in enumerate(pages_info)
-        )
+        concatenated_blocks = []
+        for i, p in enumerate(pages_info):
+            p_num = p.get("page_number", p.get("page", i + 1))
+            p_text = p.get("text", "") or p.get("combined_text", "") or p.get("ocr_text", "")
+            concatenated_blocks.append(f"--- Page {p_num} ---\n{p_text}")
+        concat_text = "\n\n".join(concatenated_blocks)
     else:
         concat_text = str(content)
         pages_info = None
@@ -497,7 +517,7 @@ def extract_with_agnes(
         is_long = True
 
     if not is_long or not pages_info:
-        messages = _build_extraction_prompt(concat_text[:25000], user_image_url=user_image_url)
+        messages = _build_extraction_prompt(concat_text[:25000])
         raw_response = chat_completion_with_retry(
             messages=messages,
             model=model,
@@ -517,16 +537,13 @@ def extract_with_agnes(
         doc_type = "Multi-page Document"
         summaries: List[str] = []
 
-        for p_data in pages_info:
-            p_num = p_data.get("page_number", 1)
-            p_text = p_data.get("text", "")
+        for i, p_data in enumerate(pages_info):
+            p_num = p_data.get("page_number", p_data.get("page", i + 1))
+            p_text = p_data.get("text", "") or p_data.get("combined_text", "") or p_data.get("ocr_text", "")
             if len(p_text.strip()) < 10:
                 continue
 
-            messages = _build_extraction_prompt(
-                f"Page {p_num}:\n{p_text}",
-                user_image_url=user_image_url,
-            )
+            messages = _build_extraction_prompt(f"--- Page {p_num} ---\n{p_text}")
             raw_response = chat_completion_with_retry(
                 messages=messages,
                 model=model,
@@ -555,7 +572,6 @@ def extract_with_agnes(
             tables=aggregated_tables,
             summary=" ".join(summaries),
             citations=aggregated_citations,
-            page_citations=[f"Page {c.page}: {c.claim}" for c in aggregated_citations],
         )
         result_dict = combined.to_dict()
 

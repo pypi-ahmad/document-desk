@@ -21,29 +21,36 @@ from src.config import (
     OLLAMA_HOST,
     OLLAMA_OCR_MODEL,
     TASK_OCR,
-    TASK_TABLE,
-    TASK_FORMULA,
-    TASK_CHART,
-    TASK_SEAL,
-    TASK_SPOTTING,
-    TASK_PREFIXES,
 )
 
+OLLAMA_SETUP_MESSAGE = f"start Ollama, then: ollama pull {OLLAMA_OCR_MODEL}"
 
-def get_ollama_client() -> ollama.Client:
-    """Return configured Ollama client."""
+
+def get_ollama_client(timeout: float = 60.0) -> ollama.Client:
+    """Create a local Ollama client using the configured host.
+
+    Args:
+        timeout: Client request timeout in seconds.
+
+    Returns:
+        Ollama client connected to `OLLAMA_HOST`.
+    """
     host = os.environ.get("OLLAMA_HOST", OLLAMA_HOST).strip()
-    return ollama.Client(host=host)
+    return ollama.Client(host=host, timeout=timeout)
 
 
 def check_ollama_status(host: Optional[str] = None) -> Tuple[bool, bool, str, List[str]]:
-    """Check if Ollama service is reachable and AuditAid/PaddleOCR-VL-1.6-0.9B is pulled.
+    """Check the local Ollama service and required OCR model.
+
+    Args:
+        host: Optional Ollama endpoint override.
 
     Returns:
-        (is_online, has_model, status_message, list_of_models)
+        A tuple of service reachability, required-model availability, safe user
+        guidance, and installed model names.
     """
     ollama_host = host or os.environ.get("OLLAMA_HOST", OLLAMA_HOST).strip()
-    target_model = os.environ.get("OLLAMA_OCR_MODEL", OLLAMA_OCR_MODEL).strip()
+    target_model = OLLAMA_OCR_MODEL
 
     try:
         url = f"{ollama_host.rstrip('/')}/api/tags"
@@ -52,7 +59,7 @@ def check_ollama_status(host: Optional[str] = None) -> Tuple[bool, bool, str, Li
             return (
                 False,
                 False,
-                f"start Ollama Desktop, then ollama pull {target_model}",
+                OLLAMA_SETUP_MESSAGE,
                 [],
             )
 
@@ -71,7 +78,7 @@ def check_ollama_status(host: Optional[str] = None) -> Tuple[bool, bool, str, Li
             return (
                 True,
                 False,
-                f"start Ollama Desktop, then ollama pull {target_model}",
+                OLLAMA_SETUP_MESSAGE,
                 model_names,
             )
 
@@ -81,7 +88,7 @@ def check_ollama_status(host: Optional[str] = None) -> Tuple[bool, bool, str, Li
         return (
             False,
             False,
-            f"start Ollama Desktop, then ollama pull {target_model}",
+            OLLAMA_SETUP_MESSAGE,
             [],
         )
 
@@ -92,7 +99,6 @@ def _call_chat_with_retry(
     prompt: str,
     image_arg: Union[str, bytes],
     temperature: float = 0.0,
-    timeout: float = 60.0,
 ) -> Any:
     """Perform chat completion with timeout and exactly one retry on failure."""
     last_err: Optional[Exception] = None
@@ -118,7 +124,7 @@ def _call_chat_with_retry(
                 continue
             raise RuntimeError(
                 f"Ollama chat failed after 1 retry: {last_err}. "
-                f"Ensure Ollama is running: start Ollama Desktop, then ollama pull {model}"
+                f"{OLLAMA_SETUP_MESSAGE}"
             ) from last_err
 
 
@@ -129,19 +135,30 @@ def run_ollama_ocr_page(
     timeout: float = 60.0,
     model: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Execute Ollama OCR on a single page image.
+    """Run the fixed local vision model against one page image.
 
-    Requirements:
-    - chat model: AuditAid/PaddleOCR-VL-1.6-0.9B
-    - temperature: 0
-    - message content starts with "OCR:"
-    - attach page image via ollama Python client's images field
-    - optional second call "Table Recognition:" when include_tables=True
-    - timeout and retry once
-    - returns {page, text, table_text, raw}
+    Args:
+        image_input: Existing image path or image bytes attached through the
+            Ollama client's `images` field.
+        page: One-based source page number stored in the result.
+        include_tables: Whether to run the `Table Recognition:` second pass.
+        timeout: Per-client request timeout in seconds.
+        model: Optional model override; it must equal the required model ID.
+
+    Returns:
+        Page number, OCR text, optional table text, raw-safe text responses,
+        and compatibility aliases.
+
+    Raises:
+        FileNotFoundError: If a supplied image path does not exist.
+        TypeError: If `image_input` is neither bytes nor a local path.
+        ValueError: If `model` differs from the required OCR model.
+        RuntimeError: If Ollama chat fails after its single retry.
     """
-    ocr_model = model or os.environ.get("OLLAMA_OCR_MODEL", OLLAMA_OCR_MODEL).strip()
-    client = get_ollama_client()
+    ocr_model = model or OLLAMA_OCR_MODEL
+    if ocr_model != OLLAMA_OCR_MODEL:
+        raise ValueError(f"OCR model must be exactly {OLLAMA_OCR_MODEL}")
+    client = get_ollama_client(timeout=timeout)
 
     # Prepare image argument (string path or raw bytes)
     if isinstance(image_input, (str, Path)):
@@ -161,7 +178,6 @@ def run_ollama_ocr_page(
         prompt="OCR:",
         image_arg=image_arg,
         temperature=0.0,
-        timeout=timeout,
     )
     ocr_text = raw_ocr_response.message.content.strip() if hasattr(raw_ocr_response, "message") else str(raw_ocr_response).strip()
 
@@ -176,7 +192,6 @@ def run_ollama_ocr_page(
             prompt="Table Recognition:",
             image_arg=image_arg,
             temperature=0.0,
-            timeout=timeout,
         )
         table_text = raw_table_response.message.content.strip() if hasattr(raw_table_response, "message") else str(raw_table_response).strip()
 
@@ -207,7 +222,21 @@ def run_page_ocr(
     task_prefix: str = TASK_OCR,
     options: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Compatibility wrapper returning dict with required keys."""
+    """Run the compatibility OCR entry point for a single page.
+
+    Args:
+        image_input: Existing image path or image bytes.
+        include_tables: Whether to run the table-recognition pass.
+        task_prefix: Retained compatibility argument; canonical OCR uses `OCR:`.
+        options: Retained compatibility options; canonical OCR fixes temperature.
+
+    Returns:
+        Canonical OCR result with page, text, table text, and raw fields.
+
+    Raises:
+        FileNotFoundError: If a supplied image path does not exist.
+        RuntimeError: If Ollama cannot complete the request.
+    """
     return run_ollama_ocr_page(
         image_input=image_input,
         page=1,
