@@ -1,14 +1,14 @@
-# Document Desk architecture
+# Document Desk Architecture
 
 This document describes the structure, data flow, storage layouts, and concurrency rules for Document Desk on Windows 11.
 
-## Architecture overview
+## Architecture Overview
 
-Document Desk runs locally on Windows 11. It combines local PDF text extraction via PyMuPDF, structured reasoning through Agnes AI (`agnes-3.0-flash`) or optional discovered providers, and local vector search using an embedded Qdrant database.
+Document Desk runs locally on Windows 11. It combines local Vision-Language OCR via Ollama (`AuditAid/PaddleOCR-VL-1.6-0.9B`), structured reasoning through Agnes AI (`agnes-3.0-flash`) or optional discovered providers, and local vector search using an embedded Qdrant database.
 
 ```mermaid
 flowchart TD
-    subgraph UI ["User interface (Streamlit on Windows 11)"]
+    subgraph UI ["User Interface (Streamlit on Windows 11)"]
         Nav["Navigation (app.py)"]
         P1["Upload (pages/1_Upload.py)"]
         P2["Extract (pages/2_Extract.py)"]
@@ -16,23 +16,29 @@ flowchart TD
         P4["Compare (pages/4_Compare.py)"]
     end
 
-    subgraph Core ["Processing engine"]
-        Cfg["Config and security (src/config.py)"]
-        Extract["Page extractor (src/extract.py)"]
-        LLM["LLM client (src/agnes_client.py)"]
-        QA["QA and diff service (src/qa_service.py)"]
-        Vec["Vector store (src/vector_store.py)"]
+    subgraph LocalOCR ["Local Vision-Language OCR Engine"]
+        Render["Page Rasterizer (pypdfium2)"]
+        OllamaSvc["Ollama HTTP (127.0.0.1:11434)<br/>AuditAid/PaddleOCR-VL-1.6-0.9B"]
+        TaskPass["Task Prefixes: OCR: & Table Recognition:"]
     end
 
-    subgraph Storage ["Local storage (data/)"]
+    subgraph Core ["Processing Engine"]
+        Cfg["Config & Security (src/config.py)"]
+        Extract["Document Extractor (src/extract.py)"]
+        LLM["Agnes Client (src/agnes_client.py)"]
+        QA["QA & Diff Service (src/qa_service.py)"]
+        Vec["Vector Store (src/vector_store.py)"]
+    end
+
+    subgraph Storage ["Local Storage (data/)"]
         Uploads["data/uploads/"]
-        Pages["data/pages/"]
+        Pages["data/pages/<file_id>/page_<n>.png"]
         Cache["data/cache/last_extract.json"]
         QdrantDB[("Embedded Qdrant (data/qdrant/)")]
         Fixtures["data/fixtures/"]
     end
 
-    subgraph Providers ["Supported LLM providers"]
+    subgraph Providers ["Cloud LLM Reasoning Providers"]
         AgnesAPI["Agnes AI API (https://apihub.agnes-ai.com/v1)<br/>agnes-3.0-flash"]
         OpenAIAPI["OpenAI Compatible (OPENAI_BASE_URL)<br/>gpt-5.6-luna, gpt-5.6-terra"]
         GeminiAPI["Google Gemini<br/>gemini-3.5-flash-lite, gemini-3.7-flash"]
@@ -40,7 +46,7 @@ flowchart TD
 
     Nav --> P1 & P2 & P3 & P4
     P1 --> Uploads
-    P1 --> Extract
+    P1 --> Render --> Pages --> OllamaSvc --> TaskPass --> Extract
     P2 --> Extract
     Extract --> LLM
     LLM --> Providers
@@ -53,30 +59,55 @@ flowchart TD
 
 ## Subsystems
 
-### Configuration and security (`src/config.py`)
+### 1. Configuration and Security (`src/config.py`)
 
 The application reads configuration from environment variables or a local `.env` file:
-- `AGNESAI_API_KEY`: Primary API key for Agnes AI. The code checks for presence only and never logs or displays the value.
+- `AGNESAI_API_KEY`: Primary API key for Agnes AI. The code checks for presence only and never logs or writes the key to disk or git.
 - `AGNES_BASE_URL`: Base URL for Agnes AI, defaulting to `https://apihub.agnes-ai.com/v1`.
+- `OLLAMA_HOST`: Local Ollama HTTP endpoint, defaulting to `http://127.0.0.1:11434`.
+- `OLLAMA_OCR_MODEL`: Ollama vision-language model, fixed to `AuditAid/PaddleOCR-VL-1.6-0.9B`.
 - `OPENAI_API_KEY` and `OPENAI_BASE_URL`: Optional credentials for OpenAI-compatible endpoints (`gpt-5.6-luna`, `gpt-5.6-terra`).
 - `GOOGLE_API_KEY`: Optional key for Google Gemini models (`gemini-3.5-flash-lite`, `gemini-3.7-flash`).
 
 Providers whose credentials are not present in the environment are hidden from the sidebar selector. All user-facing errors refer specifically to `AGNESAI_API_KEY`.
 
-### Page extraction (`src/extract.py`)
+### 2. Local Vision-Language OCR (`src/ollama_ocr.py`, `src/render_pages.py`)
 
-PyMuPDF extracts text page by page from uploaded files:
-- v1 is text-first. No PaddleOCR in v1.
-- If a page has fewer than 20 characters of extractable text, the system flags a warning that vision requires a public image URL and that v1 is text-first.
-- The system never passes local disk paths as image URLs. It sends whatever text exists across the document.
-- Documents are processed through the chosen model to produce a JSON object with title, doc_type, fields, tables, summary, and citations.
-- The parser cleans common formatting issues such as markdown fences and trailing commas before loading JSON.
-- Results are saved to `data/cache/last_extract.json` for reuse.
+- **Model Engine**: Ollama serves `AuditAid/PaddleOCR-VL-1.6-0.9B` locally on Windows 11 without requiring a native PaddlePaddle pip stack.
+- **Task Prefixes**: Prompts follow the PaddleOCR-VL protocol:
+  - `OCR:` (Default pass for full-page text detection)
+  - `Table Recognition:` (Second pass if user enables table extraction)
+  - `Formula Recognition:`
+  - `Chart Recognition:`
+  - `Seal Recognition:`
+  - `Spotting:`
+- **Image Input Handling**: PDF pages are rendered with `pypdfium2` at 150 DPI to `data/pages/<file_id>/page_<n>.png`. Local PNG and JPEG paths or raw bytes are passed directly as Ollama image attachments.
+- **URL Rule**: Local disk paths are never sent to Agnes as public image URLs.
+- **Graceful Failure**: If Ollama is offline or the model is missing, the Upload page displays:
+  `start Ollama Desktop, then ollama pull AuditAid/PaddleOCR-VL-1.6-0.9B`
+  without raising an unhandled exception or crashing Streamlit.
 
-### Embedded vector store (`src/vector_store.py`)
+### 3. Document Extraction & Structuring (`src/extract.py`)
+
+- Extracts text per page using Ollama PaddleOCR-VL or PyMuPDF native text.
+- Formulates a system prompt enforcing strict JSON output:
+  ```json
+  {
+    "title": "string",
+    "doc_type": "string",
+    "fields": [{"name": "string", "value": "string | number", "page": 1}],
+    "tables": [{"title": "string", "headers": ["..."], "rows": [["..."]]}],
+    "summary": "string",
+    "citations": [{"claim": "string", "page": 1}]
+  }
+  ```
+- Normalizes and hardens JSON parsing (stripping code fences, trailing commas, and formatting discrepancies).
+- Writes extraction results to `data/cache/last_extract.json` for instant subsequent use.
+
+### 4. Embedded Vector Store (`src/vector_store.py`)
 
 Document chunks are indexed into an embedded Qdrant instance stored on disk at `data/qdrant/` under the `documents` collection:
-- Payload schema:
+- **Payload Schema**:
   ```json
   {
     "file_id": "string",
@@ -86,79 +117,20 @@ Document chunks are indexed into an embedded Qdrant instance stored on disk at `
     "chunk_index": 0
   }
   ```
-- Chunking splits text into segments of about 500 characters with an 80-character overlap while keeping track of page numbers.
-- Searches filter chunks strictly by `file_id` so that questions retrieve text only from the selected document.
-- Embedded Qdrant locks its SQLite storage file on disk. Connections are opened for individual operations and closed immediately afterward. Only one process should access `data/qdrant/` at a time.
+- **Chunking**: Splits text into 500-character windows with 80-character overlaps while preserving page metadata.
+- **Search Filtering**: Filtered strictly by `file_id` to guarantee queries isolate chunks from the selected document.
+- **Single-Process Rule**: Embedded Qdrant locks its SQLite storage file on disk. Connections are opened for individual read/write operations and closed immediately to prevent lingering file locks.
 
-### LLM client (`src/agnes_client.py`)
+### 5. LLM Client (`src/agnes_client.py`)
 
 Calls to Agnes AI or optional providers use the official `openai` Python SDK:
 - Default endpoint: `https://apihub.agnes-ai.com/v1` with model `agnes-3.0-flash`.
 - Retries on HTTP 429 rate limit responses using exponential backoff starting at 1.5 seconds.
 - Handles HTTP 401 and 403 errors by providing a clear message pointing to `AGNESAI_API_KEY`.
 
-### Grounded Q&A and document comparison (`src/qa_service.py`)
+### 6. Grounded Q&A and Document Comparison (`src/qa_service.py`)
 
-- Question answering: Queries top-scoring chunks from Qdrant by `file_id`. If no chunks return, the system states that retrieval was empty rather than guessing an answer. When chunks are found, the model answers using only the provided text and cites the source page in brackets, such as `[Page 1]`.
-- Field comparison: Compares two document IDs. First, Python calculates the set difference of field names (`common_fields`, `only_in_a`, and `only_in_b`). Then the model evaluates only the field dictionaries to generate a table of changed values and a summary of differences.
-
-## Data flow
-
-### Ingestion and extraction flow
-
-```
-[User upload]
-       │
-       ▼
-[Save to data/uploads/<filename>]
-       │
-       ▼
-[PyMuPDF page check] ─── (text length < 20?) ───► YES ──► [Warn: vision needs public URL]
-       │                                                         │
-       ▼ NO                                                      ▼
-[Collect page text] ◄──────────────────────────────── [Send whatever text exists]
-       │
-       ▼
-[Concatenate document text]
-       │
-       ▼
-[LLM (agnes-3.0-flash)] ───► [JSON: title, doc_type, fields, tables, summary, citations]
-                                    │
-                                    ├──► [Save data/cache/last_extract.json]
-                                    └──► [Streamlit: editable table and JSON views]
-```
-
-### Semantic indexing and search flow
-
-```
-[Extracted pages with page metadata]
-       │
-       ▼
-[Text chunking (~500 chars)]
-       │
-       ▼
-[Upsert to embedded Qdrant (data/qdrant/)] ◄─── Payload: {file_id, page, text}
-       │
-       ▼
-[User question in Document Desk]
-       │
-       ▼
-[Filter query by file_id (limit k)]
-       │
-       ├──── (Retrieval empty?) ──► YES ──► Display empty retrieval message
-       │
-       ▼ NO
-[Context chunks with page metadata]
-       │
-       ▼
-[LLM prompt: answer from context only, cite pages]
-       │
-       ▼
-[Display answer with [Page X] citations and chunk inspector]
-```
-
-## Concurrency and system constraints
-
-- Native Windows 11: All scripts, commands, and paths run directly on Windows 11 without WSL2 or Docker.
-- Qdrant single-process access: Embedded Qdrant locks its SQLite files on disk via portalocker. Only one Python or Streamlit process should interact with `data/qdrant/` at any given time.
-- Secret handling: `AGNESAI_API_KEY` is checked for existence before making network calls, but is never printed or logged.
+- **Grounded Q&A**: Assembles retrieved chunks into context. Instructs `agnes-3.0-flash` to answer strictly from provided excerpts and attach explicit page citations (e.g. `[Page 1]`). If retrieval is empty, it clearly reports that no relevant chunks were found.
+- **Field-Level Diffing**:
+  1. Computes exact Python set difference on field names: `common_fields`, `only_in_a`, and `only_in_b`.
+  2. Prompts `agnes-3.0-flash` to perform a detailed comparison of values across shared fields, outputting a structured Markdown diff report.
