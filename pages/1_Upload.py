@@ -1,20 +1,33 @@
-"""Upload Page - Document Ingestion and Local Text Extraction.
+"""Upload Page - Document Ingestion and Local Ollama PaddleOCR-VL Extraction.
 
-Upload PDF or images to data/uploads/, extract per-page text via PyMuPDF,
-and handle warnings for empty text pages (v1 text-first).
+Upload PDF or images to data/uploads/, extract text per page via:
+- Ollama PaddleOCR-VL (AuditAid/PaddleOCR-VL-1.6-0.9B) for local OCR
+- Default pass: OCR:
+- Second pass: Table Recognition: if enabled
+- Native PyMuPDF text fallback for digital PDFs when OCR is not forced
+- Strict non-crash error handling if Ollama is down or model missing:
+  'start Ollama Desktop, then ollama pull AuditAid/PaddleOCR-VL-1.6-0.9B'
 """
 
 from pathlib import Path
 import streamlit as st
 
-from src.config import UPLOAD_DIR, FIXTURES_DIR
-from src.extract import ensure_sample_pdf, extract_pages_pymupdf
+from src.config import UPLOAD_DIR, FIXTURES_DIR, OLLAMA_OCR_MODEL
+from src.extract import ensure_sample_pdf, extract_document_pages
+from src.ollama_ocr import check_ollama_status
 
-st.title("📤 Document Upload & Ingestion")
+st.title("Document Upload & Ingestion")
 st.write(
-    "Upload PDF or image files to `data/uploads/`. Text is extracted per page using PyMuPDF. "
-    "If a page has no text, a warning is displayed and the rest of the document text is preserved."
+    "Upload PDFs or images to `data/uploads/`. Local vision OCR runs via Ollama "
+    f"(`{OLLAMA_OCR_MODEL}`) using task prefixes like `OCR:` and optional `Table Recognition:`."
 )
+
+# 1. Ollama Health & Model Status Check
+is_online, has_model, ollama_instruction, models = check_ollama_status()
+if not is_online or not has_model:
+    st.error("start Ollama Desktop, then ollama pull AuditAid/PaddleOCR-VL-1.6-0.9B")
+else:
+    st.success(f"Ollama is running with model `{OLLAMA_OCR_MODEL}`")
 
 sample_path = FIXTURES_DIR / "sample.pdf"
 ensure_sample_pdf(sample_path)
@@ -24,8 +37,8 @@ col_up, col_exist = st.columns([1, 1])
 with col_up:
     uploaded_file = st.file_uploader(
         "Upload PDF or image document",
-        type=["pdf", "png", "jpg", "jpeg"],
-        help="v1 is text-first. PyMuPDF extracts native text locally.",
+        type=["pdf", "png", "jpg", "jpeg", "webp", "bmp", "tiff"],
+        help="Local OCR runs via Ollama PaddleOCR-VL. Local paths are never sent to Agnes as URLs.",
     )
 
 with col_exist:
@@ -38,6 +51,22 @@ with col_exist:
         "Or choose an existing document",
         options=file_options,
         index=0,
+    )
+
+# OCR Configuration options
+st.markdown("### OCR Options")
+col_opt1, col_opt2 = st.columns(2)
+with col_opt1:
+    force_ocr = st.checkbox(
+        "Force Ollama VL OCR on all pages",
+        value=False,
+        help="Renders all PDF pages to PNG and executes Ollama PaddleOCR-VL (useful for scanned documents).",
+    )
+with col_opt2:
+    enable_tables = st.checkbox(
+        "Enable Table Recognition pass (`Table Recognition:`)",
+        value=True,
+        help="Runs a secondary pass using prompt 'Table Recognition:' to extract table structures.",
     )
 
 user_image_url = st.text_input(
@@ -69,10 +98,13 @@ if not active_file_path or not active_file_path.exists():
     st.info("Upload a document or select an existing document to begin.")
     st.stop()
 
-# Perform per-page text extraction
-with st.spinner("Extracting per-page text with PyMuPDF..."):
-    pages_info, concat_text = extract_pages_pymupdf(
-        active_file_path,
+# Perform document extraction
+with st.spinner("Extracting text and running local OCR if required..."):
+    pages_info, concat_text = extract_document_pages(
+        file_path=active_file_path,
+        file_id=active_file_id,
+        force_ocr=force_ocr,
+        include_tables=enable_tables,
         user_image_url=user_image_url if user_image_url.strip() else None,
     )
 
@@ -82,27 +114,29 @@ st.session_state["active_file_path"] = str(active_file_path)
 st.session_state[f"pages_info_{active_file_id}"] = pages_info
 st.session_state[f"concat_text_{active_file_id}"] = concat_text
 
-# Check for empty text pages and display warnings
-empty_pages = [p for p in pages_info if p.get("warning")]
-if empty_pages:
-    for ep in empty_pages:
-        st.warning(f"⚠️ {ep['warning']}")
-    st.caption("v1 is text-first. The app sends whatever text exists across the document.")
+# Check for warnings or empty pages
+warnings = [p for p in pages_info if p.get("warning")]
+if warnings:
+    for w in warnings:
+        st.warning(f"Warning: {w['warning']}")
 
 m1, m2, m3 = st.columns(3)
 m1.metric("Pages Detected", len(pages_info))
 m2.metric("Characters Extracted", len(concat_text))
-m3.metric("Text Pages", sum(1 for p in pages_info if p.get("has_text", False)))
+vl_count = sum(1 for p in pages_info if p.get("method") == "ollama_paddleocr_vl")
+m3.metric("Ollama VL OCR Pages", vl_count)
 
-with st.expander("View Extracted Page Text", expanded=True):
+with st.expander("View Extracted Page Text & Details", expanded=True):
     for p in pages_info:
-        st.markdown(f"**Page {p['page_number']}**")
+        st.markdown(f"**Page {p['page_number']}** (Method: `{p.get('method', 'native')}`)")
+        if p.get("image_path") and Path(p["image_path"]).exists():
+            st.image(p["image_path"], caption=f"Page {p['page_number']} rendered image", width=350)
         st.text_area(
-            f"Page {p['page_number']} Preview",
+            f"Page {p['page_number']} Extracted Content",
             value=p.get("text", ""),
-            height=120,
+            height=140,
             key=f"upload_preview_{p['page_number']}",
             disabled=True,
         )
 
-st.success("Document text ready. Proceed to the Extract or Ask page.")
+st.success("Document text ready. Proceed to the Extract, Ask, or Compare page.")

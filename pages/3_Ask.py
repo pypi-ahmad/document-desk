@@ -11,7 +11,7 @@ from pathlib import Path
 import streamlit as st
 
 from src.config import UPLOAD_DIR, FIXTURES_DIR, QDRANT_PATH, is_agnes_key_set
-from src.extract import ensure_sample_pdf, extract_pages_pymupdf
+from src.extract import ensure_sample_pdf, extract_document_pages
 from src.vector_store import get_qdrant_client, index_document_pages_or_text, search_document_chunks
 from src.qa_service import answer_question_with_page_citations
 
@@ -58,7 +58,9 @@ with col_k:
 if index_btn:
     with st.spinner("Chunking with page metadata and indexing into embedded Qdrant..."):
         try:
-            pages_info, _ = extract_pages_pymupdf(doc_path)
+            pages_info = st.session_state.get(f"pages_info_{doc_id}")
+            if not pages_info:
+                pages_info, _ = extract_document_pages(doc_path, file_id=doc_id)
             client = get_qdrant_client()
             num_points = index_document_pages_or_text(
                 client=client,

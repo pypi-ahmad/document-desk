@@ -10,7 +10,7 @@ import json
 import streamlit as st
 
 from src.config import UPLOAD_DIR, FIXTURES_DIR, CACHE_DIR, is_agnes_key_set
-from src.extract import ensure_sample_pdf, extract_pages_pymupdf, extract_with_agnes
+from src.extract import ensure_sample_pdf, extract_document_pages, extract_with_agnes
 from src.qa_service import compute_field_set_diff, diff_document_fields
 
 st.title("⚖️ Compare Document Versions")
@@ -71,7 +71,7 @@ def get_or_extract_fields(path: Path) -> dict:
         except Exception:
             pass
 
-    pages_info, _ = extract_pages_pymupdf(path)
+    pages_info, _ = extract_document_pages(path, file_id=stem)
     res = extract_with_agnes(pages_info, model=selected_model, provider_name=selected_provider, save_cache=True)
     return {f["name"]: f.get("value", "") for f in res.get("fields", []) if "name" in f}
 

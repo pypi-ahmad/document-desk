@@ -11,7 +11,7 @@ import pandas as pd
 import streamlit as st
 
 from src.config import UPLOAD_DIR, FIXTURES_DIR, CACHE_DIR, is_agnes_key_set
-from src.extract import ensure_sample_pdf, extract_pages_pymupdf, extract_with_agnes
+from src.extract import ensure_sample_pdf, extract_document_pages, extract_with_agnes
 
 st.title("🔬 Structured Extraction")
 st.write(
@@ -77,10 +77,13 @@ if extract_btn:
     else:
         with st.spinner(f"Running structured extraction with {selected_model}..."):
             try:
-                pages_info, _ = extract_pages_pymupdf(
-                    doc_path,
-                    user_image_url=user_image_url if user_image_url.strip() else None,
-                )
+                pages_info = st.session_state.get(f"pages_info_{doc_id}")
+                if not pages_info:
+                    pages_info, _ = extract_document_pages(
+                        doc_path,
+                        file_id=doc_id,
+                        user_image_url=user_image_url if user_image_url.strip() else None,
+                    )
                 extracted_data = extract_with_agnes(
                     pages_info,
                     user_image_url=user_image_url if user_image_url.strip() else None,
