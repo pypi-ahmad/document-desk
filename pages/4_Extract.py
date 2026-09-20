@@ -5,13 +5,15 @@ Calls agnes-3.0-flash (or selected model) to produce structured JSON:
 Displays structured JSON, an editable dataframe of fields, tables, and page citations.
 """
 
-from pathlib import Path
 import json
+from pathlib import Path
+
 import pandas as pd
 import streamlit as st
 
-from src.config import UPLOAD_DIR, FIXTURES_DIR, CACHE_DIR, is_agnes_key_set, AGNES_MODEL
-from src.extract import ensure_sample_pdf, extract_document_pages, extract_with_agnes
+from src.config import AGNES_MODEL, CACHE_DIR, is_agnes_key_set
+from src.extract import extract_with_agnes
+from src.store import get_qdrant_client, index_document_pages_or_text
 
 st.title("🔬 Structured Extraction")
 st.write(
@@ -22,52 +24,36 @@ st.write(
 selected_provider = st.session_state.get("selected_provider", "Agnes AI")
 selected_model = st.session_state.get("selected_model", AGNES_MODEL)
 
-# Discover documents
-sample_path = FIXTURES_DIR / "sample.pdf"
-ensure_sample_pdf(sample_path)
-
-existing_files = sorted(list(UPLOAD_DIR.glob("*.*")))
-file_options = []
-if sample_path.exists():
-    file_options.append("Sample Invoice Fixture (sample.pdf)")
-file_options.extend([f.name for f in existing_files])
-
-# Check for OCR cache
-sample_page_fixture = FIXTURES_DIR / "sample_page.png"
-if sample_page_fixture.exists() and "sample_page (OCR Fixture)" not in file_options:
-    file_options.append("sample_page (OCR Fixture)")
-
-if not file_options:
-    st.info("No documents found. Please upload a document on the **Upload** page first.")
+doc_id = st.session_state.get("current_file_id")
+file_path = st.session_state.get("current_file_path")
+if not doc_id or not file_path or not Path(file_path).is_file():
+    st.info("Upload a document first. Upload establishes the active file_id.")
     st.stop()
 
-selected_doc = st.selectbox("Select document to extract", options=file_options, index=0)
+doc_path = Path(file_path)
+inspection = st.session_state.get(f"inspect_{doc_id}")
+if not inspection:
+    st.info("Inspect the active document before extraction.")
+    st.stop()
 
-if selected_doc == "Sample Invoice Fixture (sample.pdf)":
-    doc_path = sample_path
-    doc_id = "sample_fixture"
-elif selected_doc == "sample_page (OCR Fixture)":
-    doc_path = sample_page_fixture
-    doc_id = "sample_page"
-else:
-    doc_path = UPLOAD_DIR / selected_doc
-    doc_id = doc_path.stem
-
+st.caption(f"Active file_id: `{doc_id}` | Route: `{inspection['route']}`")
 st.write(f"Active Provider: **{selected_provider}** | Model: `{selected_model}`")
-
-extract_btn = st.button("Run Agnes Extraction", type="primary")
 
 session_key = f"extract_data_{doc_id}"
 extracted_data = st.session_state.get(session_key)
-
-# Check cache if not in session state
 cache_file = CACHE_DIR / f"{doc_id}_extract.json"
-if extracted_data is None and cache_file.exists():
-    try:
-        extracted_data = json.loads(cache_file.read_text(encoding="utf-8"))
-        st.session_state[session_key] = extracted_data
-    except Exception:
-        pass
+ocr_required = inspection["route"] == "ollama"
+ocr_results = st.session_state.get(f"ocr_results_{doc_id}", [])
+extract_disabled = ocr_required and not ocr_results
+
+if extract_disabled:
+    st.info("This file is routed to OCR. Run OCR for this file_id before extraction.")
+
+extract_btn = st.button(
+    "Run Agnes Extraction",
+    type="primary",
+    disabled=extract_disabled,
+)
 
 if extract_btn:
     if not is_agnes_key_set() and selected_provider == "Agnes AI":
@@ -78,25 +64,32 @@ if extract_btn:
     else:
         with st.spinner(f"Running structured extraction with {selected_model}..."):
             try:
-                # Check if we have pre-extracted OCR text in session state
-                cached_ocr = st.session_state.get(f"ocr_results_{doc_id}")
-                if cached_ocr and isinstance(cached_ocr, list):
+                if ocr_required:
+                    pages_info = []
+                    for item in ocr_results:
+                        page_number = item.get("page", 1)
+                        page_text = st.session_state.get(
+                            f"page_text_{doc_id}_{page_number}"
+                        ) or item.get("combined_text", "") or item.get("text", "")
+                        pages_info.append(
+                            {
+                                "page_number": page_number,
+                                "text": page_text,
+                                "char_count": len(page_text),
+                                "image_path": None,
+                            }
+                        )
+                else:
                     pages_info = [
                         {
-                            "page_number": item.get("page", 1),
-                            "text": item.get("text", "") or item.get("combined_text", ""),
-                            "char_count": len(item.get("text", "")),
+                            "page_number": 1,
+                            "text": inspection.get("markdown", ""),
                             "image_path": None,
                         }
-                        for item in cached_ocr
                     ]
-                else:
-                    pages_info = st.session_state.get(f"pages_info_{doc_id}")
-                    if not pages_info:
-                        pages_info, _ = extract_document_pages(
-                            doc_path,
-                            file_id=doc_id,
-                        )
+
+                if not any(page.get("text", "").strip() for page in pages_info):
+                    raise ValueError("No page text is available for extraction")
 
                 extracted_data = extract_with_agnes(
                     pages_info,
@@ -106,7 +99,25 @@ if extract_btn:
                 )
                 cache_file.write_text(json.dumps(extracted_data, indent=2), encoding="utf-8")
                 st.session_state[session_key] = extracted_data
-                st.success("Extraction completed successfully!")
+                st.session_state[f"pages_info_{doc_id}"] = pages_info
+                st.session_state[f"source_markdown_{doc_id}"] = "\n\n".join(
+                    f"--- Page {page.get('page_number', page.get('page', 1))} ---\n{page['text']}"
+                    for page in pages_info
+                )
+
+                client = get_qdrant_client()
+                try:
+                    chunk_count = index_document_pages_or_text(
+                        client=client,
+                        file_id=doc_id,
+                        filename=doc_path.name,
+                        content=pages_info,
+                    )
+                finally:
+                    client.close()
+                st.success(
+                    f"Extraction completed and indexed {chunk_count} chunk(s) for Ask."
+                )
             except Exception as e:
                 st.error(f"Extraction failed: {e}")
 
@@ -124,7 +135,7 @@ if extracted_data:
     fields = extracted_data.get("fields", [])
     if fields:
         df_fields = pd.DataFrame(fields)
-        edited_df = st.data_editor(df_fields, use_container_width=True, num_rows="dynamic")
+        edited_df = st.data_editor(df_fields, width="stretch", num_rows="dynamic")
     else:
         st.info("No structured fields were extracted.")
 
@@ -140,7 +151,7 @@ if extracted_data:
             if headers and rows:
                 try:
                     df_tbl = pd.DataFrame(rows, columns=headers)
-                    st.dataframe(df_tbl, use_container_width=True)
+                    st.dataframe(df_tbl, width="stretch")
                 except Exception:
                     st.json(tbl)
             else:
@@ -153,12 +164,24 @@ if extracted_data:
             for cite in citations:
                 st.markdown(f"- **[Page {cite.get('page', '?')}]**: {cite.get('claim', '')}")
 
-    # Raw JSON
-    with st.expander("💻 Raw Structured JSON", expanded=False):
-        st.json(extracted_data)
+    markdown_export = st.session_state.get(f"source_markdown_{doc_id}", "")
+    markdown_col, json_col = st.columns(2)
+    with markdown_col:
         st.download_button(
-            "Download Extracted JSON",
+            "Download Markdown",
+            data=markdown_export,
+            file_name=f"{doc_id}.md",
+            mime="text/markdown",
+            disabled=not markdown_export,
+        )
+    with json_col:
+        st.download_button(
+            "Download extract JSON",
             data=json.dumps(extracted_data, indent=2),
             file_name=f"{doc_id}_extract.json",
             mime="application/json",
         )
+
+    # Raw JSON
+    with st.expander("💻 Raw Structured JSON", expanded=False):
+        st.json(extracted_data)

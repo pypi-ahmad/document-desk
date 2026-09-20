@@ -27,42 +27,49 @@ selected_model = st.session_state.get("selected_model", AGNES_MODEL)
 sample_path = FIXTURES_DIR / "sample.pdf"
 ensure_sample_pdf(sample_path)
 
-# Discover available files
-available_files = sorted(list(UPLOAD_DIR.glob("*.*")))
-file_options = [f.name for f in available_files]
+# Discover available file_ids
+documents = {path.stem: path for path in sorted(UPLOAD_DIR.glob("*.*"))}
 if sample_path.exists():
-    file_options.append("sample.pdf (Fixture)")
+    documents.setdefault("sample_fixture", sample_path)
+sample_page = FIXTURES_DIR / "sample_page.png"
+if sample_page.exists():
+    documents.setdefault("sample_page", sample_page)
+file_options = sorted(documents)
 
 if len(file_options) < 1:
-    st.info("No documents found in `data/uploads/` or `data/fixtures/`. Please upload documents on the Upload page first.")
+    st.info("No file IDs found. Upload documents on the Upload page first.")
     st.stop()
 
 col_a, col_b = st.columns(2)
 
 with col_a:
     st.subheader("Document A (Base Version)")
-    doc_a_choice = st.selectbox("Select Base Document", options=file_options, index=0, key="select_doc_a")
+    file_id_a = st.selectbox("Select base file_id", options=file_options, index=0, key="select_doc_a")
 
 with col_b:
     st.subheader("Document B (Comparison Version)")
     doc_b_idx = min(1, len(file_options) - 1)
-    doc_b_choice = st.selectbox("Select Comparison Document", options=file_options, index=doc_b_idx, key="select_doc_b")
+    file_id_b = st.selectbox("Select comparison file_id", options=file_options, index=doc_b_idx, key="select_doc_b")
 
 
-def resolve_file_path(choice: str) -> Path:
-    if "sample.pdf" in choice:
-        return sample_path
-    return UPLOAD_DIR / choice
+path_a = documents[file_id_a]
+path_b = documents[file_id_b]
 
 
-path_a = resolve_file_path(doc_a_choice)
-path_b = resolve_file_path(doc_b_choice)
+def get_or_extract_fields(file_id: str, path: Path) -> dict:
+    """Load cached fields or extract fields for one comparison document.
 
+    Args:
+        file_id: Document identifier used to locate the extraction cache.
+        path: Source document path when a fresh extraction is needed.
 
-def get_or_extract_fields(path: Path) -> dict:
-    """Load cached fields or run extraction."""
-    stem = path.stem
-    cache_file = CACHE_DIR / f"{stem}_extract.json"
+    Returns:
+        Mapping of extracted field names to their values.
+
+    Raises:
+        Exception: If document extraction or Agnes structuring cannot complete.
+    """
+    cache_file = CACHE_DIR / f"{file_id}_extract.json"
     if cache_file.exists():
         try:
             data = json.loads(cache_file.read_text(encoding="utf-8"))
@@ -71,8 +78,9 @@ def get_or_extract_fields(path: Path) -> dict:
         except Exception:
             pass
 
-    pages_info, _ = extract_document_pages(path, file_id=stem)
+    pages_info, _ = extract_document_pages(path, file_id=file_id)
     res = extract_with_agnes(pages_info, model=selected_model, provider_name=selected_provider, save_cache=True)
+    cache_file.write_text(json.dumps(res, indent=2), encoding="utf-8")
     return {f["name"]: f.get("value", "") for f in res.get("fields", []) if "name" in f}
 
 
@@ -87,8 +95,8 @@ if compare_btn:
     else:
         with st.spinner("Extracting and analyzing field differences..."):
             try:
-                fields_a = get_or_extract_fields(path_a)
-                fields_b = get_or_extract_fields(path_b)
+                fields_a = get_or_extract_fields(file_id_a, path_a)
+                fields_b = get_or_extract_fields(file_id_b, path_b)
 
                 # 1. Python-side set difference of field names
                 set_diff = compute_field_set_diff(fields_a, fields_b)
@@ -98,8 +106,8 @@ if compare_btn:
 
                 c1, c2, c3 = st.columns(3)
                 c1.metric("Common Fields", len(set_diff["common_fields"]))
-                c2.metric(f"Only in {doc_a_choice}", len(set_diff["only_in_a"]))
-                c3.metric(f"Only in {doc_b_choice}", len(set_diff["only_in_b"]))
+                c2.metric(f"Only in {file_id_a}", len(set_diff["only_in_a"]))
+                c3.metric(f"Only in {file_id_b}", len(set_diff["only_in_b"]))
 
                 col_comm, col_oa, col_ob = st.columns(3)
                 with col_comm:
@@ -111,7 +119,7 @@ if compare_btn:
                         st.write("None")
 
                 with col_oa:
-                    st.markdown(f"**Only in {doc_a_choice}:**")
+                    st.markdown(f"**Only in {file_id_a}:**")
                     if set_diff["only_in_a"]:
                         for f in set_diff["only_in_a"]:
                             st.markdown(f"- `{f}`")
@@ -119,7 +127,7 @@ if compare_btn:
                         st.write("None")
 
                 with col_ob:
-                    st.markdown(f"**Only in {doc_b_choice}:**")
+                    st.markdown(f"**Only in {file_id_b}:**")
                     if set_diff["only_in_b"]:
                         for f in set_diff["only_in_b"]:
                             st.markdown(f"- `{f}`")
@@ -131,9 +139,9 @@ if compare_btn:
                 st.header("2. Field Value Comparison Report (Agnes AI)")
 
                 diff_report = diff_document_fields(
-                    doc_a_name=doc_a_choice,
+                    doc_a_name=file_id_a,
                     fields_a=fields_a,
-                    doc_b_name=doc_b_choice,
+                    doc_b_name=file_id_b,
                     fields_b=fields_b,
                     model=selected_model,
                     provider_name=selected_provider,
