@@ -9,7 +9,7 @@ from pathlib import Path
 import json
 import streamlit as st
 
-from src.config import UPLOAD_DIR, FIXTURES_DIR, CACHE_DIR, is_agnes_key_set
+from src.config import UPLOAD_DIR, FIXTURES_DIR, CACHE_DIR, is_agnes_key_set, AGNES_MODEL
 from src.extract import ensure_sample_pdf, extract_document_pages, extract_with_agnes
 from src.qa_service import compute_field_set_diff, diff_document_fields
 
@@ -21,7 +21,7 @@ st.write(
 )
 
 selected_provider = st.session_state.get("selected_provider", "Agnes AI")
-selected_model = st.session_state.get("selected_model", "agnes-3.0-flash")
+selected_model = st.session_state.get("selected_model", AGNES_MODEL)
 
 # Ensure sample fixture
 sample_path = FIXTURES_DIR / "sample.pdf"
@@ -98,32 +98,42 @@ if compare_btn:
 
                 c1, c2, c3 = st.columns(3)
                 c1.metric("Common Fields", len(set_diff["common_fields"]))
-                c2.metric("Only in Doc A", len(set_diff["only_in_a"]))
-                c3.metric("Only in Doc B", len(set_diff["only_in_b"]))
+                c2.metric(f"Only in {doc_a_choice}", len(set_diff["only_in_a"]))
+                c3.metric(f"Only in {doc_b_choice}", len(set_diff["only_in_b"]))
 
-                with st.expander("View Field Name Breakdown", expanded=True):
-                    col_s1, col_s2, col_s3 = st.columns(3)
-                    with col_s1:
-                        st.markdown("**Common Field Names:**")
+                col_comm, col_oa, col_ob = st.columns(3)
+                with col_comm:
+                    st.markdown("**Common Field Names:**")
+                    if set_diff["common_fields"]:
                         for f in set_diff["common_fields"]:
-                            st.write(f"- `{f}`")
-                    with col_s2:
-                        st.markdown(f"**Only in {path_a.name}:**")
-                        for f in set_diff["only_in_a"]:
-                            st.write(f"- `{f}`")
-                    with col_s3:
-                        st.markdown(f"**Only in {path_b.name}:**")
-                        for f in set_diff["only_in_b"]:
-                            st.write(f"- `{f}`")
+                            st.markdown(f"- `{f}`")
+                    else:
+                        st.write("None")
 
-                # 2. LLM Fields-Only Diff
+                with col_oa:
+                    st.markdown(f"**Only in {doc_a_choice}:**")
+                    if set_diff["only_in_a"]:
+                        for f in set_diff["only_in_a"]:
+                            st.markdown(f"- `{f}`")
+                    else:
+                        st.write("None")
+
+                with col_ob:
+                    st.markdown(f"**Only in {doc_b_choice}:**")
+                    if set_diff["only_in_b"]:
+                        for f in set_diff["only_in_b"]:
+                            st.markdown(f"- `{f}`")
+                    else:
+                        st.write("None")
+
+                # 2. Model field-level diff
                 st.divider()
-                st.header(f"2. Field Values Diff ({selected_model})")
+                st.header("2. Field Value Comparison Report (Agnes AI)")
 
                 diff_report = diff_document_fields(
-                    doc_a_name=path_a.name,
+                    doc_a_name=doc_a_choice,
                     fields_a=fields_a,
-                    doc_b_name=path_b.name,
+                    doc_b_name=doc_b_choice,
                     fields_b=fields_b,
                     model=selected_model,
                     provider_name=selected_provider,
@@ -132,4 +142,4 @@ if compare_btn:
                 st.markdown(diff_report)
 
             except Exception as e:
-                st.error(f"Comparison error: {e}")
+                st.error(f"Version comparison failed: {e}")

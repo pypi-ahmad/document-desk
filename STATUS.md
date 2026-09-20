@@ -29,6 +29,7 @@ All automated smoke tests ran and passed:
 
 | Smoke test file | Scope and verification | Command executed | Exit code |
 | :--- | :--- | :--- | :--- |
+| [`scripts/smoke_ocr.py`](file:///D:/AI/Github/document-desk/scripts/smoke_ocr.py) | Renders/uses fixture `data/fixtures/sample_page.png`, calls Ollama `AuditAid/PaddleOCR-VL-1.6-0.9B`, verifies output and writes `data/cache/last_ocr.json`. | `.venv\Scripts\python.exe scripts/smoke_ocr.py` | 0 (Passed) |
 | [`tests/smoke_ocr_agnes.py`](file:///D:/AI/Github/document-desk/tests/smoke_ocr_agnes.py) | Generates fixture image, runs Ollama VL OCR (`AuditAid/PaddleOCR-VL-1.6-0.9B`) with `OCR:` and `Table Recognition:`, verifies structured output from `agnes-3.0-flash`, and verifies `data/cache/last_extract.json`. | `.venv\Scripts\python.exe tests/smoke_ocr_agnes.py` | 0 (Passed) |
 | [`tests/smoke_pipeline.py`](file:///D:/AI/Github/document-desk/tests/smoke_pipeline.py) | End-to-end integration: `pdf-inspector` check, `pypdfium2` page rasterization, Ollama VL dual-pass OCR, `agnes-3.0-flash` extraction, embedded Qdrant chunk indexing/retrieval, and document diffing. | `.venv\Scripts\python.exe tests/smoke_pipeline.py` | 0 (Passed) |
 | [`tests/smoke_extract.py`](file:///D:/AI/Github/document-desk/tests/smoke_extract.py) | Extracts text from fixture PDF, requests structured JSON from `agnes-3.0-flash`, validates schema, and verifies cache file. | `.venv\Scripts\python.exe tests/smoke_extract.py` | 0 (Passed) |

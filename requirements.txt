@@ -3,10 +3,10 @@ openai
 python-dotenv
 ollama
 pymupdf
-pypdfium2
-pypdf
 pillow
 pandas
 pydantic
 qdrant-client
 httpx
+pypdfium2
+pypdf

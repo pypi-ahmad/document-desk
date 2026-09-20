@@ -1,18 +1,20 @@
-"""Ollama OCR module for PaddleOCR-VL (AuditAid/PaddleOCR-VL-1.6-0.9B).
+"""Ollama PaddleOCR-VL local Vision-Language OCR integration.
 
-Runs local VL inference via the official `ollama` Python client.
-Enforces VL task prefixes:
-  OCR:
-  Table Recognition:
-  Formula Recognition:
-  Chart Recognition:
-  Seal Recognition:
-  Spotting:
-Default page pass is OCR: followed by Table Recognition: if enabled.
+Hard requirements:
+- chat model: AuditAid/PaddleOCR-VL-1.6-0.9B
+- temperature: 0
+- message content starts with "OCR:"
+- attach page image via the ollama Python client's images field
+- optional second call "Table Recognition:" when enabled
+- timeout and retry once
+- returns: {page, text, table_text, raw}
 """
 
+import os
 from pathlib import Path
+import time
 from typing import Any, Dict, List, Optional, Tuple, Union
+import httpx
 import ollama
 
 from src.config import (
@@ -28,57 +30,175 @@ from src.config import (
 )
 
 
-def check_ollama_status() -> Tuple[bool, bool, str, List[str]]:
-    """Check whether Ollama is running and whether the required PaddleOCR-VL model is present.
-    
+def get_ollama_client() -> ollama.Client:
+    """Return configured Ollama client."""
+    host = os.environ.get("OLLAMA_HOST", OLLAMA_HOST).strip()
+    return ollama.Client(host=host)
+
+
+def check_ollama_status(host: Optional[str] = None) -> Tuple[bool, bool, str, List[str]]:
+    """Check if Ollama service is reachable and AuditAid/PaddleOCR-VL-1.6-0.9B is pulled.
+
     Returns:
-        (is_running, has_model, user_message, model_names)
-        
-    If Ollama is down or model missing, user_message contains the required instruction:
-    'start Ollama Desktop, then ollama pull AuditAid/PaddleOCR-VL-1.6-0.9B'
+        (is_online, has_model, status_message, list_of_models)
     """
-    required_instruction = f"start Ollama Desktop, then ollama pull {OLLAMA_OCR_MODEL}"
+    ollama_host = host or os.environ.get("OLLAMA_HOST", OLLAMA_HOST).strip()
+    target_model = os.environ.get("OLLAMA_OCR_MODEL", OLLAMA_OCR_MODEL).strip()
+
     try:
-        client = ollama.Client(host=OLLAMA_HOST)
-        tags = client.list()
-        models = [m.model for m in tags.models]
-        has_model = any(OLLAMA_OCR_MODEL.lower() in m.lower() for m in models)
+        url = f"{ollama_host.rstrip('/')}/api/tags"
+        resp = httpx.get(url, timeout=4.0)
+        if resp.status_code != 200:
+            return (
+                False,
+                False,
+                f"start Ollama Desktop, then ollama pull {target_model}",
+                [],
+            )
+
+        data = resp.json()
+        model_names = [m.get("name", "") for m in data.get("models", [])]
+
+        # Match target model with or without tag suffix (e.g. :latest)
+        has_model = any(
+            target_model.lower() == m.lower()
+            or m.lower().startswith(f"{target_model.lower()}:")
+            or target_model.lower() in m.lower()
+            for m in model_names
+        )
+
         if not has_model:
-            return True, False, required_instruction, models
-        return True, True, f"Ollama is running with {OLLAMA_OCR_MODEL}.", models
+            return (
+                True,
+                False,
+                f"start Ollama Desktop, then ollama pull {target_model}",
+                model_names,
+            )
+
+        return (True, True, f"Ollama is online with {target_model}", model_names)
+
     except Exception:
-        return False, False, required_instruction, []
+        return (
+            False,
+            False,
+            f"start Ollama Desktop, then ollama pull {target_model}",
+            [],
+        )
 
 
-def run_ollama_vl_task(
+def _call_chat_with_retry(
+    client: ollama.Client,
+    model: str,
+    prompt: str,
+    image_arg: Union[str, bytes],
+    temperature: float = 0.0,
+    timeout: float = 60.0,
+) -> Any:
+    """Perform chat completion with timeout and exactly one retry on failure."""
+    last_err: Optional[Exception] = None
+
+    for attempt in range(1, 3):
+        try:
+            response = client.chat(
+                model=model,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": prompt,
+                        "images": [image_arg],
+                    }
+                ],
+                options={"temperature": temperature},
+            )
+            return response
+        except Exception as e:
+            last_err = e
+            if attempt == 1:
+                time.sleep(1.0)
+                continue
+            raise RuntimeError(
+                f"Ollama chat failed after 1 retry: {last_err}. "
+                f"Ensure Ollama is running: start Ollama Desktop, then ollama pull {model}"
+            ) from last_err
+
+
+def run_ollama_ocr_page(
     image_input: Union[str, Path, bytes],
-    task_prefix: str = TASK_OCR,
-    options: Optional[Dict[str, Any]] = None,
-) -> str:
-    """Run a single VL task on an image with a specific task prefix at temperature 0."""
-    if options is None:
-        options = {"temperature": 0}
+    page: int = 1,
+    include_tables: bool = False,
+    timeout: float = 60.0,
+    model: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Execute Ollama OCR on a single page image.
 
-    client = ollama.Client(host=OLLAMA_HOST)
+    Requirements:
+    - chat model: AuditAid/PaddleOCR-VL-1.6-0.9B
+    - temperature: 0
+    - message content starts with "OCR:"
+    - attach page image via ollama Python client's images field
+    - optional second call "Table Recognition:" when include_tables=True
+    - timeout and retry once
+    - returns {page, text, table_text, raw}
+    """
+    ocr_model = model or os.environ.get("OLLAMA_OCR_MODEL", OLLAMA_OCR_MODEL).strip()
+    client = get_ollama_client()
 
-    images: List[Union[str, bytes]] = []
+    # Prepare image argument (string path or raw bytes)
     if isinstance(image_input, (str, Path)):
-        resolved = Path(image_input).resolve()
-        if not resolved.exists():
-            raise FileNotFoundError(f"Image not found at {resolved}")
-        images = [str(resolved)]
+        resolved_path = Path(image_input).resolve()
+        if not resolved_path.is_file():
+            raise FileNotFoundError(f"Image file not found: {resolved_path}")
+        image_arg: Union[str, bytes] = str(resolved_path)
     elif isinstance(image_input, bytes):
-        images = [image_input]
+        image_arg = image_input
     else:
-        raise ValueError("image_input must be a file path or raw bytes")
+        raise TypeError(f"Invalid image_input type: {type(image_input)}")
 
-    response = client.generate(
-        model=OLLAMA_OCR_MODEL,
-        prompt=task_prefix,
-        images=images,
-        options=options,
+    # Pass 1: "OCR:"
+    raw_ocr_response = _call_chat_with_retry(
+        client=client,
+        model=ocr_model,
+        prompt="OCR:",
+        image_arg=image_arg,
+        temperature=0.0,
+        timeout=timeout,
     )
-    return response.response.strip()
+    ocr_text = raw_ocr_response.message.content.strip() if hasattr(raw_ocr_response, "message") else str(raw_ocr_response).strip()
+
+    table_text = ""
+    raw_table_response = None
+
+    # Pass 2: Optional "Table Recognition:"
+    if include_tables:
+        raw_table_response = _call_chat_with_retry(
+            client=client,
+            model=ocr_model,
+            prompt="Table Recognition:",
+            image_arg=image_arg,
+            temperature=0.0,
+            timeout=timeout,
+        )
+        table_text = raw_table_response.message.content.strip() if hasattr(raw_table_response, "message") else str(raw_table_response).strip()
+
+    combined_text = ocr_text
+    if table_text:
+        combined_text = f"{ocr_text}\n\n[Table Structure]:\n{table_text}"
+
+    return {
+        "page": page,
+        "text": ocr_text,
+        "table_text": table_text,
+        "raw": {
+            "ocr_response": ocr_text,
+            "table_response": table_text,
+            "model": ocr_model,
+        },
+        # Backward compatibility aliases
+        "ocr": ocr_text,
+        "tables": table_text,
+        "ocr_text": ocr_text,
+        "combined_text": combined_text,
+    }
 
 
 def run_page_ocr(
@@ -86,33 +206,10 @@ def run_page_ocr(
     include_tables: bool = False,
     task_prefix: str = TASK_OCR,
     options: Optional[Dict[str, Any]] = None,
-) -> Dict[str, str]:
-    """Execute Ollama VL OCR on image.
-    
-    Default pass: OCR:
-    Second pass: Table Recognition: if include_tables=True.
-    
-    Returns:
-        dict with keys:
-          'ocr_text': output of OCR:
-          'table_text': output of Table Recognition: (if enabled)
-          'combined_text': unified text representation for Agnes extraction
-    """
-    ocr_text = run_ollama_vl_task(image_input, task_prefix=task_prefix, options=options)
-
-    result = {
-        "ocr": ocr_text,
-        "tables": "",
-        "ocr_text": ocr_text,
-        "table_text": "",
-        "combined_text": ocr_text,
-    }
-
-    if include_tables:
-        table_text = run_ollama_vl_task(image_input, task_prefix=TASK_TABLE, options=options)
-        result["tables"] = table_text
-        result["table_text"] = table_text
-        if table_text:
-            result["combined_text"] = f"{ocr_text}\n\n[Table Structure]:\n{table_text}"
-
-    return result
+) -> Dict[str, Any]:
+    """Compatibility wrapper returning dict with required keys."""
+    return run_ollama_ocr_page(
+        image_input=image_input,
+        page=1,
+        include_tables=include_tables,
+    )

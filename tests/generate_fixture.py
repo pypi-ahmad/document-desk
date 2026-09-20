@@ -59,10 +59,23 @@ def generate_fixture():
 
     # Footer note
     draw.text((40, 390), "Payment terms: Net 30 days. Thank you for your business!", fill=(100, 100, 100))
-
     img.save(out_path, format="PNG")
-    print(f"Generated fixture image at: {out_path}")
     return out_path
+
+
+def generate_sample_page():
+    fixtures_dir = Path(__file__).resolve().parent.parent / "data" / "fixtures"
+    fixtures_dir.mkdir(parents=True, exist_ok=True)
+    out_path = fixtures_dir / "sample_page.png"
+    img = Image.new("RGB", (800, 600), color=(255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    text = "Invoice 1042 Total 26.00 Line A 10.00 Line B 16.00"
+    draw.text((50, 50), text, fill=(0, 0, 0))
+    img.save(out_path, format="PNG")
+    return out_path
+
 
 if __name__ == "__main__":
     generate_fixture()
+    generate_sample_page()
+

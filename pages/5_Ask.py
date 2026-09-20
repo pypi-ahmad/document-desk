@@ -10,7 +10,7 @@ If retrieval is empty, states so explicitly.
 from pathlib import Path
 import streamlit as st
 
-from src.config import UPLOAD_DIR, FIXTURES_DIR, QDRANT_PATH, is_agnes_key_set
+from src.config import UPLOAD_DIR, FIXTURES_DIR, QDRANT_PATH, is_agnes_key_set, AGNES_MODEL
 from src.extract import ensure_sample_pdf, extract_document_pages
 from src.vector_store import get_qdrant_client, index_document_pages_or_text, search_document_chunks
 from src.qa_service import answer_question_with_page_citations
@@ -22,7 +22,7 @@ st.write(
 )
 
 selected_provider = st.session_state.get("selected_provider", "Agnes AI")
-selected_model = st.session_state.get("selected_model", "agnes-3.0-flash")
+selected_model = st.session_state.get("selected_model", AGNES_MODEL)
 
 # Discover files
 sample_path = FIXTURES_DIR / "sample.pdf"
@@ -34,8 +34,12 @@ if sample_path.exists():
     file_options.append("Sample Invoice Fixture (sample.pdf)")
 file_options.extend([f.name for f in existing_files])
 
+fixture_page = FIXTURES_DIR / "sample_page.png"
+if fixture_page.exists() and "sample_page (OCR Fixture)" not in file_options:
+    file_options.append("sample_page (OCR Fixture)")
+
 if not file_options:
-    st.info("No documents found. Please upload a document on the Upload page first.")
+    st.info("No documents found. Please upload a document on the **Upload** page first.")
     st.stop()
 
 selected_doc = st.selectbox("Select document to query", options=file_options, index=0)
@@ -43,6 +47,9 @@ selected_doc = st.selectbox("Select document to query", options=file_options, in
 if selected_doc == "Sample Invoice Fixture (sample.pdf)":
     doc_path = sample_path
     doc_id = "sample_fixture"
+elif selected_doc == "sample_page (OCR Fixture)":
+    doc_path = fixture_page
+    doc_id = "sample_page"
 else:
     doc_path = UPLOAD_DIR / selected_doc
     doc_id = doc_path.stem
@@ -58,9 +65,23 @@ with col_k:
 if index_btn:
     with st.spinner("Chunking with page metadata and indexing into embedded Qdrant..."):
         try:
-            pages_info = st.session_state.get(f"pages_info_{doc_id}")
-            if not pages_info:
-                pages_info, _ = extract_document_pages(doc_path, file_id=doc_id)
+            # Check if we have pre-extracted OCR text in session state
+            cached_ocr = st.session_state.get(f"ocr_results_{doc_id}")
+            if cached_ocr and isinstance(cached_ocr, list):
+                pages_info = [
+                    {
+                        "page_number": item.get("page", 1),
+                        "text": item.get("text", "") or item.get("combined_text", ""),
+                        "char_count": len(item.get("text", "")),
+                        "image_path": None,
+                    }
+                    for item in cached_ocr
+                ]
+            else:
+                pages_info = st.session_state.get(f"pages_info_{doc_id}")
+                if not pages_info:
+                    pages_info, _ = extract_document_pages(doc_path, file_id=doc_id)
+
             client = get_qdrant_client()
             num_points = index_document_pages_or_text(
                 client=client,
@@ -77,7 +98,7 @@ if index_btn:
 with st.form("ask_question_form"):
     question = st.text_input(
         "Enter your question about this document:",
-        placeholder="e.g. What is the total amount due and what are the payment terms?",
+        placeholder="e.g. What is the invoice number and total amount due?",
     )
     submit_btn = st.form_submit_button("Submit Question", type="primary")
 
@@ -100,13 +121,13 @@ if submit_btn and question.strip():
                 )
                 client.close()
 
-                # If retrieval empty, say so explicitly
                 if not retrieved:
                     st.warning(
-                        "Retrieval returned empty. No relevant chunks found for this document in Qdrant. "
-                        "Please click 'Index / Re-Index Document into Qdrant' first."
+                        f"No relevant document chunks found in Qdrant for document `{doc_id}`. "
+                        "Please index the document first using the button above."
                     )
                 else:
+                    # 2. Call Agnes to answer strictly from chunks citing pages
                     answer = answer_question_with_page_citations(
                         question=question,
                         chunks=retrieved,
@@ -114,16 +135,16 @@ if submit_btn and question.strip():
                         provider_name=selected_provider,
                     )
 
-                    st.markdown("### Grounded Answer")
-                    st.info(answer)
+                    st.markdown("### Answer")
+                    st.markdown(answer)
 
-                    with st.expander(f"Inspect {len(retrieved)} Retrieved Chunks", expanded=False):
-                        for idx, ch in enumerate(retrieved, 1):
-                            st.markdown(
-                                f"**Chunk {idx}** | Page {ch.get('page')} | Score: `{ch.get('score', 0):.3f}`"
-                            )
-                            st.text(ch.get("text", ""))
-                            st.divider()
+                    # Show retrieved excerpts in expander
+                    with st.expander(f"📚 Retrieved Context Chunks ({len(retrieved)})", expanded=False):
+                        for idx, hit in enumerate(retrieved):
+                            page_ref = hit.get("page", 1)
+                            score = hit.get("score", 0.0)
+                            st.markdown(f"**Chunk {idx + 1} (Page {page_ref}, Score: {score:.2f}):**")
+                            st.text(hit.get("text", ""))
 
             except Exception as e:
-                st.error(f"Error during question answering: {e}")
+                st.error(f"Failed to query document: {e}")
