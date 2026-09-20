@@ -2,7 +2,7 @@
 
 Streamlit application entry point:
 - Sidebar: Agnes model fixed default agnes-3.0-flash; OCR model name shown read-only.
-- Multi-page navigation: Health, Upload, OCR, Extract, Ask, Compare.
+- Multi-page navigation: Health, Upload, Inspect, OCR, Extract, Ask, Compare.
 """
 
 import streamlit as st
@@ -19,6 +19,10 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+st.session_state.setdefault("force_ocr", False)
+st.session_state.setdefault("include_tables", False)
+st.session_state.setdefault("current_file_id", None)
 
 # ----------------- Shared Sidebar -----------------
 with st.sidebar:
@@ -45,8 +49,25 @@ with st.sidebar:
         disabled=True,
         help="Read-only: Local Ollama model AuditAid/PaddleOCR-VL-1.6-0.9B.",
     )
+    st.checkbox(
+        "Force OCR",
+        key="force_ocr",
+        help="Route PDFs through local Ollama OCR even when native Markdown is usable.",
+    )
+    st.checkbox(
+        "Table recognition",
+        key="include_tables",
+        help="Run an optional second OCR pass starting with `Table Recognition:`.",
+    )
 
     st.divider()
+
+    active_file_id = st.session_state.get("current_file_id")
+    st.caption(
+        f"Active file_id: `{active_file_id}`"
+        if active_file_id
+        else "Active file_id: none — upload a document first."
+    )
 
     # Environment and Storage Status
     st.subheader("🔒 Environment Status")
@@ -70,6 +91,11 @@ upload_page = st.Page(
     title="Upload",
     icon="📤",
 )
+inspect_page = st.Page(
+    "pages/3_Inspect.py",
+    title="Inspect",
+    icon=":material/find_in_page:",
+)
 ocr_page = st.Page(
     "pages/3_OCR.py",
     title="OCR",
@@ -92,7 +118,15 @@ compare_page = st.Page(
 )
 
 pg = st.navigation(
-    [health_page, upload_page, ocr_page, extract_page, ask_page, compare_page],
+    [
+        health_page,
+        upload_page,
+        inspect_page,
+        ocr_page,
+        extract_page,
+        ask_page,
+        compare_page,
+    ],
     position="sidebar",
 )
 

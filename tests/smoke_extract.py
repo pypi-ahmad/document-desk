@@ -1,4 +1,4 @@
-"""Smoke test for PyMuPDF page extraction and Agnes AI JSON structuring.
+"""Smoke test for native PDF extraction and Agnes AI JSON structuring.
 
 If data/fixtures/sample.pdf is missing, generates a short invoice-like PDF,
 runs extract on it against agnes-3.0-flash, verifies hardened JSON parsing,
@@ -15,10 +15,19 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE_DIR))
 
 from src.config import CACHE_DIR, FIXTURES_DIR, is_agnes_key_set
-from src.extract import ensure_sample_pdf, extract_pages_pymupdf, extract_with_agnes
+from src.extract import ensure_sample_pdf, extract_pages, extract_with_agnes
 
 
 def run_smoke():
+    """Run native fixture extraction and live Agnes schema validation.
+
+    Returns:
+        True when extraction and cache assertions pass.
+
+    Raises:
+        RuntimeError: If `AGNESAI_API_KEY` is unavailable.
+        AssertionError: If extraction schema or cache validation fails.
+    """
     print("=== Step 0: Check AGNESAI_API_KEY ===")
     if not is_agnes_key_set():
         raise RuntimeError(
@@ -33,12 +42,12 @@ def run_smoke():
     assert sample_pdf.exists(), f"Failed to find or generate {sample_pdf}"
     print(f"[PASS] Fixture PDF verified at {sample_pdf} ({sample_pdf.stat().st_size} bytes)")
 
-    print("\n=== Step 2: Extract Pages with PyMuPDF ===")
-    pages_info, concat_text = extract_pages_pymupdf(sample_pdf)
+    print("\n=== Step 2: Extract Pages with pdf-inspector / pypdfium2 ===")
+    pages_info, concat_text = extract_pages(sample_pdf)
     print(f"Pages detected: {len(pages_info)}")
     print(f"Concatenated text preview:\n{concat_text[:250]}...\n")
     assert len(concat_text) > 50, "Text extraction returned insufficient content"
-    print("[PASS] PyMuPDF page text extraction successful.")
+    print("[PASS] Page text extraction successful.")
 
     print("\n=== Step 3: Run Extract against agnes-3.0-flash ===")
     result = extract_with_agnes(pages_info, save_cache=True)

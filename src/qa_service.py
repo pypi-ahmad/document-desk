@@ -6,7 +6,7 @@ Uses Agnes AI (agnes-3.0-flash) or selected provider to:
 - Compute Python-side set diffs of field names.
 """
 
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Set
 import json
 
 from src.agnes_client import chat_completion_with_retry
@@ -19,9 +19,20 @@ def answer_question_with_page_citations(
     model: str = AGNES_MODEL,
     provider_name: str = "Agnes AI",
 ) -> str:
-    """Generate an answer using retrieved chunks, enforcing page citations.
-    
-    If chunks is empty, explicitly returns a notice that retrieval is empty.
+    """Answer a question from retrieved chunks with required page citations.
+
+    Args:
+        question: User question to answer from document evidence.
+        chunks: Retrieved chunk dictionaries containing page and text fields.
+        model: Agnes model identifier.
+        provider_name: Configured provider display name.
+
+    Returns:
+        A grounded cited answer, or an explicit empty-retrieval message without
+        calling Agnes when `chunks` is empty.
+
+    Raises:
+        AgnesClientError: If a non-empty grounded completion cannot be produced.
     """
     if not chunks:
         return "Retrieval returned empty. No relevant chunks found for this document in Qdrant."
@@ -68,7 +79,15 @@ def compute_field_set_diff(
     fields_a: Dict[str, Any],
     fields_b: Dict[str, Any],
 ) -> Dict[str, List[str]]:
-    """Compute Python-side set difference of field names between two documents."""
+    """Compute deterministic field-name set differences for two documents.
+
+    Args:
+        fields_a: First document's field-name-to-value mapping.
+        fields_b: Second document's field-name-to-value mapping.
+
+    Returns:
+        Sorted common, first-only, and second-only field-name lists.
+    """
     set_a: Set[str] = set(fields_a.keys())
     set_b: Set[str] = set(fields_b.keys())
 
@@ -87,7 +106,22 @@ def diff_document_fields(
     model: str = AGNES_MODEL,
     provider_name: str = "Agnes AI",
 ) -> str:
-    """Prompt LLM to diff extracted fields only between two documents."""
+    """Request a prose comparison of two extracted-field mappings.
+
+    Args:
+        doc_a_name: Display name of the base document.
+        fields_a: Base document's field-name-to-value mapping.
+        doc_b_name: Display name of the comparison document.
+        fields_b: Comparison document's field-name-to-value mapping.
+        model: Agnes model identifier.
+        provider_name: Configured provider display name.
+
+    Returns:
+        Markdown-oriented Agnes report limited to the supplied extracted fields.
+
+    Raises:
+        AgnesClientError: If the comparison completion cannot be produced.
+    """
     str_a = json.dumps(fields_a, indent=2)
     str_b = json.dumps(fields_b, indent=2)
 

@@ -16,6 +16,15 @@ from src.qa_service import compute_field_set_diff, diff_document_fields
 
 
 def run_smoke():
+    """Run deterministic field-set and live Agnes value-comparison checks.
+
+    Returns:
+        True when both comparison stages complete successfully.
+
+    Raises:
+        RuntimeError: If `AGNESAI_API_KEY` is unavailable.
+        AssertionError: If expected field differences or model output are absent.
+    """
     print("=== Step 0: Check AGNESAI_API_KEY ===")
     if not is_agnes_key_set():
         raise RuntimeError("AGNESAI_API_KEY is not configured.")

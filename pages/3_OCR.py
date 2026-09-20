@@ -14,12 +14,15 @@ import streamlit as st
 
 from src.config import (
     PAGES_DIR,
-    FIXTURES_DIR,
     CACHE_DIR,
     OLLAMA_OCR_MODEL,
 )
-from src.ollama_ocr import check_ollama_status, run_ollama_ocr_page
-from src.pdf_pages import render_pdf_pages, sanitize_file_id
+from src.ollama_ocr import (
+    OLLAMA_SETUP_MESSAGE,
+    check_ollama_status,
+    run_ollama_ocr_page,
+)
+from src.render_pages import render_all_pages
 
 st.title("👁️ Local Vision-Language OCR")
 st.write(
@@ -27,43 +30,43 @@ st.write(
     f"at temperature 0 with task prefixes."
 )
 
-# Ollama status check banner
-is_online, has_model, status_msg, _ = check_ollama_status()
-if not is_online or not has_model:
-    st.error(
-        f"⚠️ Action Required: **start Ollama Desktop, then ollama pull {OLLAMA_OCR_MODEL}**"
-    )
-
 st.divider()
 
-# Select document / file_id
-file_dirs = [d for d in PAGES_DIR.glob("*") if d.is_dir() and list(d.glob("page-*.png"))]
-file_options = [d.name for d in file_dirs]
-
-# Add fixture option if available
-fixture_page = FIXTURES_DIR / "sample_page.png"
-if fixture_page.exists() and "sample_page" not in file_options:
-    file_options.insert(0, "sample_page (fixture)")
-
-current_file_id = st.session_state.get("current_file_id", file_options[0] if file_options else None)
-
-selected_file_id = st.selectbox(
-    "Select Document to OCR",
-    options=file_options if file_options else ["No rendered documents available"],
-    index=file_options.index(current_file_id) if (file_options and current_file_id in file_options) else 0,
-)
-
-if not file_options or selected_file_id == "No rendered documents available":
-    st.info("No rendered pages found. Upload a document on the **Upload** page first.")
+doc_id = st.session_state.get("current_file_id")
+file_path = st.session_state.get("current_file_path")
+if not doc_id or not file_path or not Path(file_path).is_file():
+    st.info("Upload a document first. Upload establishes the active file_id.")
     st.stop()
 
-# Determine page paths
-if "fixture" in selected_file_id:
-    doc_pages = [fixture_page]
-    doc_id = "sample_page"
-else:
-    doc_id = selected_file_id
-    doc_pages = sorted(list((PAGES_DIR / doc_id).glob("page-*.png")))
+inspection = st.session_state.get(f"inspect_{doc_id}")
+if not inspection:
+    st.info("Inspect the active document before OCR.")
+    st.stop()
+if inspection.get("route") != "ollama":
+    st.success(f"OCR skipped for `{doc_id}`. {inspection.get('route_reason', '')}")
+    st.stop()
+
+is_online, has_model, _status_msg, _ = check_ollama_status()
+if not is_online or not has_model:
+    st.error(OLLAMA_SETUP_MESSAGE)
+
+st.caption(f"Active file_id: `{doc_id}`")
+st.info(f"OCR route reason: {inspection.get('route_reason', '')}")
+
+doc_pages = sorted((PAGES_DIR / doc_id).glob("page-*.png"))
+if not doc_pages:
+    with st.spinner("Rendering routed pages with pypdfium2..."):
+        try:
+            doc_pages = render_all_pages(
+                file_path,
+                file_id=doc_id,
+                dpi=150,
+                route="ollama",
+            )
+            st.session_state[f"pages_{doc_id}"] = [str(path) for path in doc_pages]
+        except Exception as exc:
+            st.error(f"Page rendering failed: {exc}")
+            st.stop()
 
 st.subheader(f"Page Gallery ({len(doc_pages)} page(s))")
 
@@ -71,18 +74,15 @@ st.subheader(f"Page Gallery ({len(doc_pages)} page(s))")
 cols = st.columns(min(len(doc_pages), 4))
 for idx, page_path in enumerate(doc_pages):
     with cols[idx % len(cols)]:
-        st.image(str(page_path), caption=f"Page {idx + 1}: {page_path.name}", use_container_width=True)
+        st.image(str(page_path), caption=f"Page {idx + 1}: {page_path.name}", width="stretch")
 
 st.divider()
 
 # OCR Execution Controls
 col_opts, col_run = st.columns([2, 1])
 with col_opts:
-    include_tables = st.checkbox(
-        "Enable secondary Table Recognition pass (`Table Recognition:`)",
-        value=False,
-        help="Runs an additional pass specifically tuned for complex tables.",
-    )
+    include_tables = bool(st.session_state.get("include_tables", False))
+    st.caption(f"Table recognition: {'on' if include_tables else 'off'} (sidebar)")
     selected_page_idx = st.selectbox(
         "Select specific page to process (or process all)",
         options=["All Pages"] + [f"Page {i+1} ({p.name})" for i, p in enumerate(doc_pages)],
@@ -119,29 +119,26 @@ if run_ocr_btn:
                 st.error(f"OCR failed for {p_path.name}: {e}")
         progress_bar.progress((i + 1) / len(pages_to_process))
 
-    # Save to session state and cache
-    st.session_state[f"ocr_results_{doc_id}"] = ocr_results
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    last_ocr_file = CACHE_DIR / "last_ocr.json"
-    last_ocr_file.write_text(
-        json.dumps(ocr_results[0] if len(ocr_results) == 1 else ocr_results, indent=2),
-        encoding="utf-8",
-    )
-    st.success(f"OCR complete! Results saved to `{last_ocr_file}`")
+    if ocr_results:
+        st.session_state[f"ocr_results_{doc_id}"] = ocr_results
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        last_ocr_file = CACHE_DIR / "last_ocr.json"
+        last_ocr_file.write_text(
+            json.dumps(ocr_results[0] if len(ocr_results) == 1 else ocr_results, indent=2),
+            encoding="utf-8",
+        )
+        st.success(f"OCR complete! Results saved to `{last_ocr_file}`")
+    else:
+        st.error(OLLAMA_SETUP_MESSAGE)
 
 # Display OCR outputs (raw model text and editable text)
 cached_results = st.session_state.get(f"ocr_results_{doc_id}", [])
-if not cached_results and (CACHE_DIR / "last_ocr.json").exists():
-    try:
-        loaded = json.loads((CACHE_DIR / "last_ocr.json").read_text(encoding="utf-8"))
-        cached_results = [loaded] if isinstance(loaded, dict) else loaded
-    except Exception:
-        cached_results = []
 
 if cached_results:
     st.divider()
     st.subheader("OCR Results & Verification")
 
+    editable_pages = []
     for idx, item in enumerate(cached_results):
         p_num = item.get("page", idx + 1)
         st.markdown(f"### Page {p_num}")
@@ -170,12 +167,21 @@ if cached_results:
         with col_edit:
             st.markdown("**Editable Page Text:**")
             initial_edit_text = item.get("combined_text") or item.get("text", "")
+            edit_key = f"edited_text_{doc_id}_{p_num}"
+            if edit_key not in st.session_state:
+                st.session_state[edit_key] = initial_edit_text
             edited_text = st.text_area(
                 f"Editable Text (Page {p_num})",
-                value=st.session_state.get(f"edited_text_{doc_id}_{p_num}", initial_edit_text),
                 height=430,
-                key=f"edited_text_{doc_id}_{p_num}",
+                key=edit_key,
             )
             st.session_state[f"page_text_{doc_id}_{p_num}"] = edited_text
+            editable_pages.append(f"--- Page {p_num} ---\n{edited_text}")
 
+    st.download_button(
+        "Download Markdown",
+        data="\n\n".join(editable_pages),
+        file_name=f"{doc_id}.md",
+        mime="text/markdown",
+    )
     st.info("👉 Text is ready! Proceed to the **Extract** page to structure fields into JSON with Agnes AI.")

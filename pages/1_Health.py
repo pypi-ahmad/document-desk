@@ -17,7 +17,7 @@ from src.config import (
     is_agnes_key_set,
 )
 from src.agnes_client import get_llm_client
-from src.ollama_ocr import check_ollama_status
+from src.ollama_ocr import OLLAMA_SETUP_MESSAGE, check_ollama_status
 
 st.title("🩺 System Health & Connectivity")
 st.write(
@@ -32,7 +32,7 @@ st.subheader("1. Local Ollama Service Status")
 st.caption(f"Endpoint: `{OLLAMA_HOST}` | Expected OCR Model: `{OLLAMA_OCR_MODEL}`")
 
 with st.spinner("Checking Ollama /api/tags..."):
-    is_online, has_model, status_msg, model_names = check_ollama_status()
+    is_online, has_model, _status_msg, model_names = check_ollama_status()
 
 col_ol1, col_ol2 = st.columns([1, 1])
 with col_ol1:
@@ -48,10 +48,7 @@ with col_ol2:
         st.error(f"❌ OCR Model: **`{OLLAMA_OCR_MODEL}` Missing**")
 
 if not is_online or not has_model:
-    st.error(
-        f"⚠️ Action Required:\n\n"
-        f"**start Ollama Desktop, then ollama pull {OLLAMA_OCR_MODEL}**"
-    )
+    st.error(OLLAMA_SETUP_MESSAGE)
 
 with st.expander("View Available Ollama Models", expanded=False):
     if model_names:

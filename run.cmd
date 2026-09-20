@@ -34,5 +34,11 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo [Starting Streamlit app...]
-call .venv\Scripts\streamlit run app.py
+set "STREAMLIT_PORT=8592"
+for /f "tokens=5" %%P in ('netstat -ano ^| findstr /R /C:":%STREAMLIT_PORT% .*LISTENING"') do (
+    echo [Stopping existing process on port %STREAMLIT_PORT%: PID %%P]
+    taskkill /PID %%P /T /F >nul 2>&1
+)
+
+echo [Starting Streamlit app on port %STREAMLIT_PORT%...]
+call .venv\Scripts\streamlit run app.py --server.port %STREAMLIT_PORT%

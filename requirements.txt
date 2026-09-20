@@ -2,11 +2,10 @@ streamlit
 openai
 python-dotenv
 ollama
-pymupdf
+pdf-inspector
+pypdfium2
 pillow
 pandas
 pydantic
 qdrant-client
 httpx
-pypdfium2
-pypdf
