@@ -123,3 +123,57 @@ def chat_completion_with_retry(
     if last_error:
         raise AgnesClientError(f"Failed to complete request: {last_error}") from last_error
     return ""
+
+
+def structure_document_text(
+    text_content: str,
+    model: str = AGNES_MODEL,
+    provider_name: str = "Agnes AI",
+) -> str:
+    """Structure document text into JSON using Agnes AI."""
+    import json
+    from src.extract import extract_with_agnes
+    res = extract_with_agnes(text_content, model=model, provider_name=provider_name)
+    return json.dumps(res, indent=2)
+
+
+def ask_document_question(
+    question: str,
+    context: str,
+    file_id: Optional[str] = None,
+    model: str = AGNES_MODEL,
+    provider_name: str = "Agnes AI",
+) -> str:
+    """Answer question given context text."""
+    from src.qa_service import answer_question_with_page_citations
+    chunks = [{"page": 1, "text": context, "file_id": file_id or "doc"}]
+    return answer_question_with_page_citations(
+        question=question,
+        chunks=chunks,
+        model=model,
+        provider_name=provider_name,
+    )
+
+
+def compare_document_diffs(
+    doc_a_text: str,
+    doc_b_text: str,
+    name_a: str = "Document A",
+    name_b: str = "Document B",
+    model: str = AGNES_MODEL,
+    provider_name: str = "Agnes AI",
+) -> str:
+    """Compare two documents text."""
+    from src.qa_service import diff_document_fields
+    fields_a = {"content": doc_a_text}
+    fields_b = {"content": doc_b_text}
+    return diff_document_fields(
+        doc_a_name=name_a,
+        fields_a=fields_a,
+        doc_b_name=name_b,
+        fields_b=fields_b,
+        model=model,
+        provider_name=provider_name,
+    )
+
+

@@ -1,21 +1,15 @@
-"""Document extraction module using PyMuPDF and Agnes AI (or selected LLM provider).
+"""Document extraction module using Ollama PaddleOCR-VL, PyMuPDF, and Agnes AI.
 
-Per-page text extraction via pymupdf:
-- v1 is text-first. No PaddleOCR in v1.
-- If a page has no text (< 20 characters), records a warning:
-  "Page X has no text. Agnes vision needs a public image URL. v1 is text-first."
-- Sends whatever text exists across the document.
-- Never pretends local disk paths are public image URLs.
-- Calls agnes-3.0-flash (or selected provider) to produce structured JSON:
-  {
-    "title": string,
-    "doc_type": string,
-    "fields": [{"name": string, "value": string | number, "page": int}],
-    "tables": [{"title": string, "headers": [string], "rows": [[string | number]]}],
-    "summary": string,
-    "citations": [{"claim": string, "page": int}],
-    "page_citations": [string]
-  }
+Pipeline:
+1. User uploads a PDF or image.
+2. Local OCR / page parse via Ollama model AuditAid/PaddleOCR-VL-1.6-0.9B:
+   - Uses task prefix 'OCR:'
+   - Optional second pass 'Table Recognition:' if tables enabled
+   - Renders PDF pages with pypdfium2/PyMuPDF to local PNG
+   - Passes page images as local image attachments (path or bytes) to Ollama
+   - Never sends local disk paths to Agnes as public image URLs
+3. Agnes AI (agnes-3.0-flash via official openai SDK) structures fields, tables, summary, citations.
+4. Cached extraction saved to data/cache/last_extract.json.
 """
 
 from dataclasses import dataclass, field
@@ -27,7 +21,18 @@ import pymupdf as fitz
 from PIL import Image
 
 from src.agnes_client import chat_completion_with_retry, AgnesClientError
-from src.config import CACHE_DIR, FIXTURES_DIR, PAGES_DIR, AGNES_MODEL, is_agnes_key_set
+from src.config import (
+    CACHE_DIR,
+    FIXTURES_DIR,
+    PAGES_DIR,
+    AGNES_MODEL,
+    is_agnes_key_set,
+    OLLAMA_OCR_MODEL,
+    TASK_OCR,
+    TASK_TABLE,
+)
+from src.ollama_ocr import check_ollama_status, run_page_ocr
+from src.render_pages import render_page
 
 
 @dataclass
@@ -166,18 +171,23 @@ def parse_and_harden_json(raw_text: str) -> Dict[str, Any]:
     raise ValueError(f"Failed to parse valid JSON from LLM response:\n{raw_text[:500]}")
 
 
-def extract_pages_pymupdf(
+def extract_document_pages(
     file_path: Union[str, Path],
+    file_id: Optional[str] = None,
+    force_ocr: bool = False,
+    include_tables: bool = False,
     user_image_url: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], str]:
-    """Extract per-page text from PDF or image using PyMuPDF.
+    """Extract per-page text from PDF or image using local Ollama VL or native text.
     
-    Hard rules for v1:
-    - Text-first: PyMuPDF extracts native text.
-    - If a page has no text (< 20 characters), records a warning:
-      'Page X has no text. Agnes vision needs a public image URL. v1 is text-first.'
-    - Still sends whatever text exists across the document.
-    - Never passes local file paths as image URLs.
+    Hard rules:
+    - Ollama model: AuditAid/PaddleOCR-VL-1.6-0.9B
+    - Page images are local PNG/JPEG passed as Ollama image attachments (path or bytes).
+    - Never send local disk paths to Agnes as public image URLs.
+    - Default OCR pass: 'OCR:'
+    - Second pass: 'Table Recognition:' if include_tables=True.
+    - If Ollama is down or model missing: clear error message:
+      'start Ollama Desktop, then ollama pull AuditAid/PaddleOCR-VL-1.6-0.9B'.
     
     Returns:
       (pages_info, concatenated_text)
@@ -187,14 +197,16 @@ def extract_pages_pymupdf(
         raise FileNotFoundError(f"File not found: {path}")
 
     stem = re.sub(r"[^\w\-]", "_", path.stem)
-    suffix = path.suffix.lower()
+    if not file_id:
+        file_id = stem
 
+    suffix = path.suffix.lower()
     pages_info: List[Dict[str, Any]] = []
     concatenated_blocks: List[str] = []
 
-    valid_url = None
-    if user_image_url and (user_image_url.strip().startswith("http://") or user_image_url.strip().startswith("https://")):
-        valid_url = user_image_url.strip()
+    # Check Ollama status
+    is_online, has_model, ollama_instruction, _ = check_ollama_status()
+    ollama_ready = is_online and has_model
 
     if suffix == ".pdf":
         doc = fitz.open(str(path))
@@ -204,36 +216,68 @@ def extract_pages_pymupdf(
             page_num = idx + 1
             page = doc[idx]
             raw_text = page.get_text().strip()
+            has_native_text = len(raw_text) >= 20
 
-            if len(raw_text) < 20:
-                # Page with no or minimal text
-                warn_msg = f"Page {page_num} has no text. Agnes vision needs a public image URL. v1 is text-first."
+            # Determine if this page should undergo Ollama VL OCR
+            should_run_ocr = force_ocr or (not has_native_text)
 
-                # Save local PNG preview only for local UI display
-                png_path = PAGES_DIR / f"{stem}_page_{page_num}.png"
-                pix = page.get_pixmap(dpi=150)
-                pix.save(str(png_path))
+            if should_run_ocr:
+                # Render page to PNG using pypdfium2
+                try:
+                    img_path = render_page(path, page_num, file_id=file_id, dpi=150)
+                except Exception:
+                    # Fallback to PyMuPDF pixmap
+                    target_dir = PAGES_DIR / file_id
+                    target_dir.mkdir(parents=True, exist_ok=True)
+                    img_path = target_dir / f"page_{page_num}.png"
+                    pix = page.get_pixmap(dpi=150)
+                    pix.save(str(img_path))
 
-                note = f"Page {page_num}: text empty."
-                if valid_url:
-                    note += f" (Public Image URL: {valid_url})"
+                if ollama_ready:
+                    # Run Ollama VL: Pass 1: OCR: ; Pass 2: Table Recognition: (if enabled)
+                    ocr_res = run_page_ocr(
+                        image_input=img_path,
+                        include_tables=include_tables,
+                        task_prefix=TASK_OCR,
+                    )
+                    page_text = ocr_res["combined_text"]
+                    pages_info.append({
+                        "page_number": page_num,
+                        "text": page_text,
+                        "has_text": bool(page_text.strip()),
+                        "image_path": str(img_path),
+                        "ocr_text": ocr_res.get("ocr_text", ""),
+                        "table_text": ocr_res.get("table_text", ""),
+                        "method": "ollama_paddleocr_vl",
+                        "warning": None,
+                    })
+                    concatenated_blocks.append(f"--- Page {page_num} ---\n{page_text}")
                 else:
-                    note += " (No extractable text; Agnes vision requires a public image URL. v1 is text-first.)"
+                    # Ollama down or model missing
+                    warn_msg = ollama_instruction
+                    fallback_text = raw_text if has_native_text else f"[Page {page_num}: No text extracted. {ollama_instruction}]"
+                    pages_info.append({
+                        "page_number": page_num,
+                        "text": fallback_text,
+                        "has_text": has_native_text,
+                        "image_path": str(img_path),
+                        "ocr_text": "",
+                        "table_text": "",
+                        "method": "native_fallback_ollama_offline",
+                        "warning": warn_msg,
+                    })
+                    concatenated_blocks.append(f"--- Page {page_num} ---\n{fallback_text}")
 
-                pages_info.append({
-                    "page_number": page_num,
-                    "text": note,
-                    "has_text": False,
-                    "image_path": str(png_path),
-                    "warning": warn_msg,
-                })
-                concatenated_blocks.append(f"--- Page {page_num} ---\n{note}")
             else:
+                # Use native PyMuPDF text
                 pages_info.append({
                     "page_number": page_num,
                     "text": raw_text,
                     "has_text": True,
                     "image_path": None,
+                    "ocr_text": "",
+                    "table_text": "",
+                    "method": "pymupdf_native",
                     "warning": None,
                 })
                 concatenated_blocks.append(f"--- Page {page_num} ---\n{raw_text}")
@@ -241,31 +285,64 @@ def extract_pages_pymupdf(
         doc.close()
 
     elif suffix in [".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff"]:
-        png_path = PAGES_DIR / f"{stem}_page_1.png"
+        target_dir = PAGES_DIR / file_id
+        target_dir.mkdir(parents=True, exist_ok=True)
+        img_copy = target_dir / "page_1.png"
         img = Image.open(path)
-        img.save(png_path, format="PNG")
+        img.save(img_copy, format="PNG")
 
-        warn_msg = "Image file uploaded. Agnes vision needs a public image URL. v1 is text-first."
-
-        note = "Page 1: Image file uploaded."
-        if valid_url:
-            note += f" (Public Image URL: {valid_url})"
+        if ollama_ready:
+            ocr_res = run_page_ocr(
+                image_input=img_copy,
+                include_tables=include_tables,
+                task_prefix=TASK_OCR,
+            )
+            page_text = ocr_res["combined_text"]
+            pages_info.append({
+                "page_number": 1,
+                "text": page_text,
+                "has_text": bool(page_text.strip()),
+                "image_path": str(img_copy),
+                "ocr_text": ocr_res.get("ocr_text", ""),
+                "table_text": ocr_res.get("table_text", ""),
+                "method": "ollama_paddleocr_vl",
+                "warning": None,
+            })
+            concatenated_blocks.append(f"--- Page 1 ---\n{page_text}")
         else:
-            note += " (Agnes vision needs a public image URL. v1 is text-first. No extractable text stream.)"
-
-        pages_info.append({
-            "page_number": 1,
-            "text": note,
-            "has_text": False,
-            "image_path": str(png_path),
-            "warning": warn_msg,
-        })
-        concatenated_blocks.append(f"--- Page 1 ---\n{note}")
+            warn_msg = ollama_instruction
+            note = f"[Page 1 Image: {ollama_instruction}]"
+            pages_info.append({
+                "page_number": 1,
+                "text": note,
+                "has_text": False,
+                "image_path": str(img_copy),
+                "ocr_text": "",
+                "table_text": "",
+                "method": "image_ollama_offline",
+                "warning": warn_msg,
+            })
+            concatenated_blocks.append(f"--- Page 1 ---\n{note}")
     else:
         raise ValueError(f"Unsupported document format: {suffix}")
 
     concatenated_text = "\n\n".join(concatenated_blocks)
     return pages_info, concatenated_text
+
+
+def extract_pages_pymupdf(
+    file_path: Union[str, Path],
+    user_image_url: Optional[str] = None,
+    force_ocr: bool = False,
+    include_tables: bool = False,
+) -> Tuple[List[Dict[str, Any]], str]:
+    """Compatibility wrapper routing to extract_document_pages."""
+    return extract_document_pages(
+        file_path=file_path,
+        force_ocr=force_ocr,
+        include_tables=include_tables,
+        user_image_url=user_image_url,
+    )
 
 
 def _build_extraction_prompt(text_content: str, user_image_url: Optional[str] = None) -> List[Dict[str, str]]:

@@ -1,7 +1,9 @@
 streamlit
 openai
 python-dotenv
+ollama
 pymupdf
+pypdfium2
 pypdf
 pillow
 pandas

@@ -200,3 +200,23 @@ def search_document_chunks(
         }
         for hit in hits
     ]
+
+
+def index_document_chunks(
+    client: QdrantClient,
+    file_id: str,
+    filename: str,
+    text: Union[str, List[Dict[str, Any]]],
+    collection_name: str = QDRANT_COLLECTION,
+    vector_size: int = 256,
+) -> int:
+    """Alias for index_document_pages_or_text."""
+    return index_document_pages_or_text(
+        client=client,
+        file_id=file_id,
+        filename=filename,
+        content=text,
+        collection_name=collection_name,
+        vector_size=vector_size,
+    )
+

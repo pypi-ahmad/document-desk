@@ -23,8 +23,8 @@ from src.config import (
     PAGES_DIR,
     TASK_OCR,
     TASK_TABLE,
-    check_ollama_status,
 )
+from src.ollama_ocr import check_ollama_status
 
 
 class ProcessingError(Exception):
@@ -93,7 +93,7 @@ def run_ollama_vl_task(
     task_prefix: str = TASK_OCR,
 ) -> str:
     """Run PaddleOCR-VL model via official ollama Python client at temperature 0."""
-    is_online, has_model, err_msg = check_ollama_status()
+    is_online, has_model, err_msg, _ = check_ollama_status()
     if not is_online or not has_model:
         raise ProcessingError(f"Ollama unavailable: {err_msg}")
 

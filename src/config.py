@@ -2,6 +2,7 @@
 
 Reads environment variable names only; never hardcodes, logs, or exposes secret values.
 Supports provider discovery: Agnes AI (default), OpenAI Compatible, and Google Gemini.
+Configures local Ollama VL integration for PaddleOCR-VL.
 """
 
 import os
@@ -32,10 +33,33 @@ AGNES_BASE_URL_ENV = "AGNES_BASE_URL"
 OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
 OPENAI_BASE_URL_ENV = "OPENAI_BASE_URL"
 GOOGLE_API_KEY_ENV = "GOOGLE_API_KEY"
+OLLAMA_HOST_ENV = "OLLAMA_HOST"
+OLLAMA_OCR_MODEL_ENV = "OLLAMA_OCR_MODEL"
 
-# Primary defaults
+# Primary LLM defaults
 AGNES_MODEL = "agnes-3.0-flash"
 AGNES_BASE_URL = os.environ.get(AGNES_BASE_URL_ENV, "https://apihub.agnes-ai.com/v1").strip() or "https://apihub.agnes-ai.com/v1"
+
+# Ollama OCR configuration
+OLLAMA_HOST = os.environ.get(OLLAMA_HOST_ENV, "http://127.0.0.1:11434").strip() or "http://127.0.0.1:11434"
+OLLAMA_OCR_MODEL = "AuditAid/PaddleOCR-VL-1.6-0.9B"
+
+# Task prefixes from PaddleOCR-VL llama.cpp / Ollama readme
+TASK_OCR = "OCR:"
+TASK_TABLE = "Table Recognition:"
+TASK_FORMULA = "Formula Recognition:"
+TASK_CHART = "Chart Recognition:"
+TASK_SEAL = "Seal Recognition:"
+TASK_SPOTTING = "Spotting:"
+
+TASK_PREFIXES = {
+    "OCR": TASK_OCR,
+    "Table Recognition": TASK_TABLE,
+    "Formula Recognition": TASK_FORMULA,
+    "Chart Recognition": TASK_CHART,
+    "Seal Recognition": TASK_SEAL,
+    "Spotting": TASK_SPOTTING,
+}
 
 
 def is_agnes_key_set() -> bool:
@@ -56,7 +80,6 @@ def get_available_providers() -> Dict[str, Dict[str, Any]]:
     providers: Dict[str, Dict[str, Any]] = {}
 
     # Primary provider: Agnes AI
-    # Always include Agnes AI slot (error handled gracefully if key missing)
     providers["Agnes AI"] = {
         "name": "Agnes AI",
         "models": ["agnes-3.0-flash"],
